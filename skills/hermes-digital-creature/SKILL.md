@@ -22,6 +22,24 @@ metadata:
         description: "Autonomy level: off, gentle, or active. Tool actions still follow approval gates."
         default: "gentle"
         prompt: "Digital Creature autonomy level"
+      - key: digital_creature.touchpoint_time
+        description: "Local time (HH:MM) for the daily touchpoint when autonomy is gentle or active."
+        default: "09:00"
+        prompt: "Daily touchpoint time"
+      - key: digital_creature.sleep_time
+        description: "Local time (HH:MM) for the nightly sleep review when autonomy is active."
+        default: "21:00"
+        prompt: "Sleep review time"
+      - key: digital_creature.progress_time
+        description: "Local time (HH:MM) for the weekly progress summary when autonomy is active."
+        default: "19:00"
+        prompt: "Weekly progress time"
+      - key: digital_creature.progress_day
+        description: "Weekday (Mon..Sun) for the weekly progress summary when autonomy is active."
+        default: "Sun"
+        prompt: "Weekly progress day"
+    requires:
+      hermes_features: [cron]
 ---
 
 # Hermes Digital Creature
@@ -38,7 +56,8 @@ Keep the primary UX conversational and brief enough for Telegram. Use short choi
 - Never claim an emotion, relationship fact, memory, capability, or completed background action that is not supported by state or an actual tool result.
 - Do not use guilt, dependency language, manufactured distress, streak pressure, or unsolicited intimacy to retain the user.
 - Ask before recording sensitive personal information. Do not store secrets, credentials, access tokens, intimate data, or raw private files as memories.
-- Require explicit approval before filesystem mutations outside the creature data directory, shell execution beyond this state script, credential use, external network actions, destructive operations, persistent configuration changes, or any action the active Hermes safety policy treats as critical.
+- Require explicit approval before filesystem mutations outside the creature data directory, shell execution beyond this state script, credential use, external network actions, destructive operations, persistent configuration changes (other than the proactive task set implied by the current autonomy level), or any action the active Hermes safety policy treats as critical.
+- The `digital_creature.autonomy` setting **is** the user's consent for the proactive cron set produced by `proactive-plan`. Tasks outside that set still require an explicit chat request. An approval to register the autonomy-implied set is never an approval for tool actions, network actions, or external writes during those runs.
 - Keep action logs inspectable. Tell the user what an expedition intends to do before approval and summarize actual evidence afterward.
 - Do not self-modify code, install dependencies, update binaries, or loosen security boundaries.
 
@@ -67,6 +86,11 @@ python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" feedback -
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" progress
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" daily
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" sleep
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-plan --autonomy gentle
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-diff --autonomy active
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-register --task-id "<id>" --schedule "<expr>" --autonomy gentle --prompt "<prompt>"
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-list --status registered
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-revoke --task-id "<id>" --reason "<why>"
 ```
 
 Read [references/state-model.md](references/state-model.md) before doing memory maintenance, export/deletion, trait evolution, or interpreting scores. Read [references/interaction-protocols.md](references/interaction-protocols.md) before initiating activities or Telegram-facing flows. Read [references/autonomy-and-scheduling.md](references/autonomy-and-scheduling.md) before proposing a cron job or tool expedition.
@@ -90,11 +114,17 @@ When presenting recalled material, phrase confidence honestly: `I remember...`, 
 
 On `/hermes-digital-creature start` or when no state exists:
 
-1. Initialize the database.
-2. Explain in at most four short lines: this is local persistent state, memories are inspectable/deletable, proactive behavior is opt-in, and critical tool actions require approval.
-3. Ask for only the first useful preference: desired name for the creature, preferred interaction tone, or whether daily check-ins should be offered.
-4. Record only what the user supplies or confirms.
-5. Do not fabricate a backstory, bond, mood history, or progress.
+1. Verify Hermes cron is available (`hermes cron list` runs). If not, tell the user proactive features are disabled in this environment, treat autonomy as `off`, and skip step 4. Continue with the rest.
+2. Initialize the database.
+3. Explain in at most four short lines: state is local and inspectable/deletable, autonomy is configurable (`off`/`gentle`/`active`), critical tool actions still require approval, and the user can disable proactive contact at any time by saying so in chat.
+4. Read `digital_creature.autonomy` and the four time settings from skill config. Run `proactive-diff --autonomy <level>` to see what needs to change. For each `to_register`/`to_update` task, ask Hermes to call its `cronjob` tool with the provided `schedule`, `skill`, `prompt`, and `deliver`, then record the result with `proactive-register`. For each `to_revoke`, remove the job via Hermes cron and record `proactive-revoke`. Summarize in one line: *"Зарегистрировал N проактивных задачи; скажи 'отключи проактивность' чтобы снять"*.
+5. Ask for only the first useful preference: desired name for the creature or preferred interaction tone. Do not require this — it's optional.
+6. Record only what the user supplies or confirms.
+7. Do not fabricate a backstory, bond, mood history, or progress.
+
+When the user changes autonomy mid-session, repeat step 4 to align registered tasks with the new level (auto-register new tasks, auto-revoke obsolete ones, summarize once).
+
+Phrases that mean **disable proactive**: "отключи проактивность", "не пиши сам", "хватит писать", "stop proactive", "turn off check-ins". Treat as `autonomy = off`: revoke every registered proactive task, write a feedback record describing the change, and confirm in one line.
 
 ## Activities
 
@@ -156,7 +186,8 @@ Respond to user requests with these operations:
 
 - If the terminal or Python state script cannot run, say that persistence is unavailable in this turn. Continue as an ordinary assistant without claiming to remember or evolve.
 - If recall returns nothing useful, do not invent continuity; proceed normally.
-- If a proposed proactive/scheduled behavior is unconfigured, ask before creating it.
+- If Hermes cron is unavailable, degrade autonomy to `off` silently for the user but disclose: *"Проактивные задачи не зарегистрированы — Hermes cron недоступен"*. Do not invent a fake schedule or claim scheduled behavior.
+- If `proactive-diff` shows pending changes but `cronjob` registration fails, do not record `proactive-register`. Report the failure and the remaining gap to the user.
 - If a tool expedition fails, report failure and uncertainty and record the evaluation; do not transform it into narrative success.
 
 ## Verification
@@ -166,4 +197,5 @@ Before claiming the creature feature is operating:
 - Confirm `init`/`status` returns valid JSON and a local database location.
 - Confirm memory writes and corrections appear in `audit`.
 - Confirm all autonomy/tool behavior respects approval gates and quiet hours.
+- Confirm `proactive-list --status registered` matches what Hermes cron actually has scheduled.
 - Confirm the user can inspect, export, archive, and purge creature data.

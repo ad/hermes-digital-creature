@@ -63,8 +63,15 @@ SENSITIVE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 TOKEN_PATTERN = re.compile(r"[\w-]{2,}", re.UNICODE)
-SCHEMA_VERSION = 1
+TIME_PATTERN = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+AUTONOMY_LEVELS = ("off", "gentle", "active")
+SCHEMA_VERSION = 2
 MARKER_FILENAME = ".hermes-digital-creature-state"
+DEFAULT_TOUCHPOINT_TIME = "09:00"
+DEFAULT_SLEEP_TIME = "21:00"
+DEFAULT_PROGRESS_TIME = "19:00"
+DEFAULT_PROGRESS_DAY = "Sun"
 
 
 def now_iso() -> str:
@@ -210,9 +217,29 @@ class Store:
                 entity_id TEXT,
                 detail TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS proactive_tasks (
+                task_id TEXT PRIMARY KEY,
+                schedule TEXT NOT NULL,
+                autonomy TEXT NOT NULL,
+                description TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                deliver TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'registered',
+                registered_at TEXT NOT NULL,
+                revoked_at TEXT,
+                consent_source TEXT NOT NULL
+            );
             """
         )
         timestamp = now_iso()
+        current_version = self.conn.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        if current_version and int(current_version["value"]) < SCHEMA_VERSION:
+            self.conn.execute(
+                "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                (str(SCHEMA_VERSION),),
+            )
         self.conn.execute(
             "INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
@@ -269,6 +296,9 @@ def cmd_status(store: Store, _: argparse.Namespace) -> None:
         for row in store.conn.execute("SELECT status, COUNT(*) AS count FROM activities GROUP BY status")
     }
     last_event = store.conn.execute("SELECT created_at, action FROM audit ORDER BY id DESC LIMIT 1").fetchone()
+    proactive_rows = store.conn.execute(
+        "SELECT task_id, schedule, autonomy, status FROM proactive_tasks WHERE status = 'registered' ORDER BY task_id"
+    ).fetchall()
     emit(
         {
             "ok": True,
@@ -278,6 +308,7 @@ def cmd_status(store: Store, _: argparse.Namespace) -> None:
             "capabilities": capabilities,
             "feedback_count": feedback_count,
             "activities": activities,
+            "proactive_tasks": [serialize(row) for row in proactive_rows],
             "last_event": serialize(last_event) if last_event else None,
         }
     )
@@ -673,7 +704,7 @@ def cmd_export(store: Store, args: argparse.Namespace) -> None:
         f"{store.db_path.name}-wal",
     }:
         fail("export output cannot overwrite creature state database or ownership marker")
-    tables = ("metadata", "memories", "memory_links", "traits", "capabilities", "feedback", "activities", "reflections", "audit")
+    tables = ("metadata", "memories", "memory_links", "traits", "capabilities", "feedback", "activities", "reflections", "audit", "proactive_tasks")
     payload: dict[str, Any] = {"exported_at": now_iso(), "schema_version": SCHEMA_VERSION}
     for table in tables:
         rows = store.conn.execute(f"SELECT * FROM {table}").fetchall()
@@ -697,6 +728,188 @@ def cmd_purge(store: Store, args: argparse.Namespace) -> None:
     store.close()
     shutil.rmtree(data_dir)
     emit({"ok": True, "purged": str(data_dir)})
+
+
+def validate_time(value: str, label: str) -> str:
+    if not TIME_PATTERN.match(value):
+        fail(f"invalid {label} (expected HH:MM): {value}")
+    return value
+
+
+def proactive_plan_tasks(
+    autonomy: str,
+    touchpoint_time: str,
+    sleep_time: str,
+    progress_time: str,
+    progress_day: str,
+) -> list[dict[str, str]]:
+    if autonomy not in AUTONOMY_LEVELS:
+        fail(f"invalid autonomy: {autonomy}")
+    if progress_day not in WEEKDAYS:
+        fail(f"invalid progress day (Mon..Sun): {progress_day}")
+    validate_time(touchpoint_time, "touchpoint-time")
+    validate_time(sleep_time, "sleep-time")
+    validate_time(progress_time, "progress-time")
+    if autonomy == "off":
+        return []
+    daily = {
+        "task_id": "digital-creature-daily-touchpoint",
+        "schedule": f"every 1d at {touchpoint_time}",
+        "skill": "hermes-digital-creature",
+        "prompt": (
+            "Run the daily touchpoint protocol. Respect quiet hours and autonomy. "
+            "If there is no useful low-friction question or grounded observation, do not create artificial engagement."
+        ),
+        "deliver": "origin",
+        "description": "Daily check-in: surface one recall candidate or clarification.",
+    }
+    if autonomy == "gentle":
+        return [daily]
+    sleep_task = {
+        "task_id": "digital-creature-sleep-review",
+        "schedule": f"every 1d at {sleep_time}",
+        "skill": "hermes-digital-creature",
+        "prompt": (
+            "Run the sleep protocol locally. Surface at most one grounded insight or memory "
+            "clarification at the next appropriate contact. Do not perform network or external file actions."
+        ),
+        "deliver": "local",
+        "description": "Nightly sleep analysis: stale memories, conflicts, recent feedback.",
+    }
+    weekly = {
+        "task_id": "digital-creature-weekly-progress",
+        "schedule": f"every 1 week on {progress_day} at {progress_time}",
+        "skill": "hermes-digital-creature",
+        "prompt": (
+            "Summarize progress: confirmed memories, feedback coverage, completed activities, "
+            "calibrated traits. Offer at most one eligible capability suggestion. Do not unlock without consent."
+        ),
+        "deliver": "origin",
+        "description": "Weekly progress summary and eligible capability suggestions.",
+    }
+    return [daily, sleep_task, weekly]
+
+
+def cmd_proactive_plan(store: Store, args: argparse.Namespace) -> None:
+    tasks = proactive_plan_tasks(
+        args.autonomy, args.touchpoint_time, args.sleep_time, args.progress_time, args.progress_day
+    )
+    emit({"ok": True, "autonomy": args.autonomy, "tasks": tasks})
+
+
+def cmd_proactive_register(store: Store, args: argparse.Namespace) -> None:
+    if args.autonomy not in AUTONOMY_LEVELS:
+        fail(f"invalid autonomy: {args.autonomy}")
+    timestamp = now_iso()
+    existing = store.conn.execute(
+        "SELECT * FROM proactive_tasks WHERE task_id = ?", (args.task_id,)
+    ).fetchone()
+    description = args.description or ""
+    prompt = args.prompt or ""
+    deliver = args.deliver or "origin"
+    if (
+        existing
+        and existing["status"] == "registered"
+        and existing["schedule"] == args.schedule
+        and existing["autonomy"] == args.autonomy
+    ):
+        emit({"ok": True, "already_registered": True, "task_id": args.task_id})
+        return
+    store.conn.execute(
+        """
+        INSERT INTO proactive_tasks(task_id, schedule, autonomy, description, prompt, deliver,
+                                    status, registered_at, revoked_at, consent_source)
+        VALUES (?, ?, ?, ?, ?, ?, 'registered', ?, NULL, ?)
+        ON CONFLICT(task_id) DO UPDATE SET
+            schedule = excluded.schedule,
+            autonomy = excluded.autonomy,
+            description = excluded.description,
+            prompt = excluded.prompt,
+            deliver = excluded.deliver,
+            status = 'registered',
+            registered_at = excluded.registered_at,
+            revoked_at = NULL,
+            consent_source = excluded.consent_source
+        """,
+        (
+            args.task_id,
+            args.schedule,
+            args.autonomy,
+            description,
+            prompt,
+            deliver,
+            timestamp,
+            args.consent_source or f"autonomy:{args.autonomy}",
+        ),
+    )
+    store.audit(
+        "proactive-register",
+        "proactive_task",
+        args.task_id,
+        {"schedule": args.schedule, "autonomy": args.autonomy},
+    )
+    store.conn.commit()
+    emit({"ok": True, "task_id": args.task_id, "status": "registered"})
+
+
+def cmd_proactive_list(store: Store, args: argparse.Namespace) -> None:
+    rows = store.conn.execute(
+        "SELECT * FROM proactive_tasks ORDER BY registered_at DESC"
+    ).fetchall()
+    if args.status:
+        rows = [row for row in rows if row["status"] == args.status]
+    emit({"ok": True, "tasks": [serialize(row) for row in rows]})
+
+
+def cmd_proactive_revoke(store: Store, args: argparse.Namespace) -> None:
+    row = store.conn.execute(
+        "SELECT * FROM proactive_tasks WHERE task_id = ?", (args.task_id,)
+    ).fetchone()
+    if not row:
+        fail(f"proactive task not found: {args.task_id}")
+    if row["status"] == "revoked":
+        emit({"ok": True, "already_revoked": True, "task_id": args.task_id})
+        return
+    timestamp = now_iso()
+    store.conn.execute(
+        "UPDATE proactive_tasks SET status = 'revoked', revoked_at = ? WHERE task_id = ?",
+        (timestamp, args.task_id),
+    )
+    reason = args.reason or ""
+    store.audit("proactive-revoke", "proactive_task", args.task_id, {"reason": reason})
+    store.conn.commit()
+    emit({"ok": True, "task_id": args.task_id, "status": "revoked"})
+
+
+def cmd_proactive_diff(store: Store, args: argparse.Namespace) -> None:
+    desired = proactive_plan_tasks(
+        args.autonomy, args.touchpoint_time, args.sleep_time, args.progress_time, args.progress_day
+    )
+    desired_by_id = {task["task_id"]: task for task in desired}
+    current = {
+        row["task_id"]: dict(row)
+        for row in store.conn.execute(
+            "SELECT * FROM proactive_tasks WHERE status = 'registered'"
+        ).fetchall()
+    }
+    to_register: list[dict[str, str]] = []
+    to_update: list[dict[str, str]] = []
+    for task_id, task in desired_by_id.items():
+        existing = current.get(task_id)
+        if not existing:
+            to_register.append(task)
+        elif existing["schedule"] != task["schedule"] or existing["autonomy"] != args.autonomy:
+            to_update.append(task)
+    to_revoke = [task_id for task_id in current if task_id not in desired_by_id]
+    emit(
+        {
+            "ok": True,
+            "autonomy": args.autonomy,
+            "to_register": to_register,
+            "to_update": to_update,
+            "to_revoke": to_revoke,
+        }
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -804,6 +1017,42 @@ def parser() -> argparse.ArgumentParser:
     purge = commands.add_parser("purge")
     purge.add_argument("--confirm", required=True)
     purge.set_defaults(func=cmd_purge)
+
+    def add_time_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--touchpoint-time", default=DEFAULT_TOUCHPOINT_TIME)
+        p.add_argument("--sleep-time", default=DEFAULT_SLEEP_TIME)
+        p.add_argument("--progress-time", default=DEFAULT_PROGRESS_TIME)
+        p.add_argument("--progress-day", default=DEFAULT_PROGRESS_DAY, choices=WEEKDAYS)
+
+    proactive_plan_p = commands.add_parser("proactive-plan")
+    proactive_plan_p.add_argument("--autonomy", choices=AUTONOMY_LEVELS, required=True)
+    add_time_args(proactive_plan_p)
+    proactive_plan_p.set_defaults(func=cmd_proactive_plan)
+
+    proactive_register_p = commands.add_parser("proactive-register")
+    proactive_register_p.add_argument("--task-id", required=True)
+    proactive_register_p.add_argument("--schedule", required=True)
+    proactive_register_p.add_argument("--autonomy", choices=AUTONOMY_LEVELS, required=True)
+    proactive_register_p.add_argument("--description", default="")
+    proactive_register_p.add_argument("--prompt", default="")
+    proactive_register_p.add_argument("--deliver", default="origin")
+    proactive_register_p.add_argument("--consent-source", default="")
+    proactive_register_p.set_defaults(func=cmd_proactive_register)
+
+    proactive_list_p = commands.add_parser("proactive-list")
+    proactive_list_p.add_argument("--status", choices=("registered", "revoked"))
+    proactive_list_p.set_defaults(func=cmd_proactive_list)
+
+    proactive_revoke_p = commands.add_parser("proactive-revoke")
+    proactive_revoke_p.add_argument("--task-id", required=True)
+    proactive_revoke_p.add_argument("--reason", default="")
+    proactive_revoke_p.set_defaults(func=cmd_proactive_revoke)
+
+    proactive_diff_p = commands.add_parser("proactive-diff")
+    proactive_diff_p.add_argument("--autonomy", choices=AUTONOMY_LEVELS, required=True)
+    add_time_args(proactive_diff_p)
+    proactive_diff_p.set_defaults(func=cmd_proactive_diff)
+
     return root
 
 

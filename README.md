@@ -71,7 +71,7 @@ The location is configurable through the Hermes skill config setting `digital_cr
 - Hermes Agent with skills enabled.
 - Python 3.10 or newer for the bundled state runtime.
 - A configured Hermes messaging gateway when using Telegram.
-- Hermes cron support only if proactive daily/sleep interactions are desired.
+- Hermes cron support. **Required** when `digital_creature.autonomy` is `gentle` or `active` — the skill auto-registers proactive tasks at first contact. If Hermes cron is unavailable, the skill degrades to `off` and tells the user.
 
 The skill is model-agnostic. For the intended interaction quality, use a model with structured tool calling, reliable multi-step reasoning, streaming, and a context window of at least 32k.
 
@@ -113,6 +113,10 @@ The skill declares these non-secret Hermes settings:
 | `digital_creature.data_dir` | `~/.hermes/data/hermes-digital-creature` | Local SQLite state, exports, and ownership marker |
 | `digital_creature.quiet_hours` | `23:00-08:00` | Suppress proactive delivery in local time |
 | `digital_creature.autonomy` | `gentle` | `off`, `gentle`, or `active` behavior profile |
+| `digital_creature.touchpoint_time` | `09:00` | Daily touchpoint time (HH:MM, local) for `gentle`/`active` |
+| `digital_creature.sleep_time` | `21:00` | Nightly sleep review time for `active` |
+| `digital_creature.progress_time` | `19:00` | Weekly progress summary time for `active` |
+| `digital_creature.progress_day` | `Sun` | Weekly progress summary weekday for `active` |
 
 Run the Hermes config migration after installation, or set values directly:
 
@@ -244,17 +248,17 @@ The runtime creates an ownership marker and refuses to purge an unowned non-empt
 
 The skill is designed for an existing Hermes Telegram gateway. It does not configure a bot token or provision the gateway itself.
 
-Proactive behavior is intentionally bounded:
+Proactive behavior is driven by the `digital_creature.autonomy` setting. At first contact the skill auto-registers the matching cron tasks through Hermes cron; the autonomy setting itself counts as the user's consent for that task set.
 
-| Mode | Behavior |
-| --- | --- |
-| `off` | Only responds when invoked; no scheduled creature tasks |
-| `gentle` | Can offer an approved daily memory/reflection touchpoint |
-| `active` | Can offer approved expeditions in addition to touchpoints |
+| Mode | Registered automatically | Other proactive behavior |
+| --- | --- | --- |
+| `off` | nothing | none — only responds when invoked |
+| `gentle` | daily touchpoint (`touchpoint_time`, default `09:00`) | none beyond that single task |
+| `active` | daily touchpoint + nightly sleep review (`sleep_time`, default `21:00`) + weekly progress summary (`progress_day` `progress_time`, default Sun `19:00`) | may propose scoped expeditions during a touchpoint (each still needs per-action approval) |
 
-The user must explicitly approve scheduled jobs, external network actions, credential usage, writes outside creature state, destructive operations, and persistent configuration changes.
+External network actions, credential usage, writes outside creature state, destructive operations, and **non-default** scheduled jobs still require explicit per-action approval, regardless of autonomy.
 
-After opt-in, Hermes cron can attach this skill to a daily touchpoint or sleep review. Exact scheduling is managed by Hermes, as described in [autonomy-and-scheduling.md](skills/hermes-digital-creature/references/autonomy-and-scheduling.md).
+The user can disable proactive contact at any time by saying so in chat ("отключи проактивность", "stop proactive", etc.) — the skill revokes every registered task and switches to `off`. See [autonomy-and-scheduling.md](skills/hermes-digital-creature/references/autonomy-and-scheduling.md) for the full registration flow and schema.
 
 ## Privacy And Security
 

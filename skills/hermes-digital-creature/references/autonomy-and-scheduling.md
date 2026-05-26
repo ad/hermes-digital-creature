@@ -1,61 +1,82 @@
 # Autonomy And Scheduling
 
-Read this reference before initiating background work, proposing cron setup, running sleep/reflection, or starting a tool expedition.
+Read this reference before initiating background work, reconciling scheduled jobs, running sleep/reflection, or starting a tool expedition.
 
-## Autonomy Levels
+## Prerequisite
 
-| Setting | Allowed proactive behavior |
-| --- | --- |
-| `off` | Respond only when invoked; no scheduled jobs |
-| `gentle` | Offer daily memory/reflection touchpoint only after opt-in; no unapproved external tool actions |
-| `active` | Offer touchpoints and approved scoped expeditions; critical actions still require approval |
+Hermes cron is **required** when autonomy is `gentle` or `active`. The skill verifies availability during first contact and on every autonomy change. If `hermes cron list` fails to run, treat autonomy as `off` for this environment, tell the user once, and do not pretend tasks were scheduled.
 
-`quiet_hours` suppresses proactive delivery. It never grants permission to perform actions silently.
+## Autonomy Levels And Default Schedule
 
-## Approval Gates
+| Setting | Tasks registered automatically | Other allowed proactive behavior |
+| --- | --- | --- |
+| `off` | none | only responds when invoked |
+| `gentle` | daily touchpoint at `digital_creature.touchpoint_time` (default `09:00`) | none beyond that single task |
+| `active` | daily touchpoint + nightly sleep review (default `21:00`) + weekly progress summary (default Sun `19:00`) | may propose scoped tool expeditions during a touchpoint; expedition itself still requires per-action approval |
 
-Always obtain explicit approval for:
+The autonomy setting itself **is** the consent for the task set above. Time and weekday defaults can be overridden through skill config (`touchpoint_time`, `sleep_time`, `progress_time`, `progress_day`).
 
-- creating, editing, enabling, or removing scheduled jobs;
-- network searches, API actions, or messages sent externally as an expedition;
+`quiet_hours` suppresses delivery during the configured window. A suppressed run defers to the next allowed contact; it does not silently perform actions.
+
+## Approval Gates (Unchanged)
+
+Even at `active`, always obtain explicit per-action approval for:
+
+- creating, editing, or removing **non-default** scheduled jobs (anything outside `proactive-plan`);
+- network searches, API actions, messages sent externally as part of an expedition;
 - filesystem writes outside `digital_creature.data_dir`;
 - credentials or personal data access;
 - destructive cleanup, archive batches, or full purge;
-- persistent Hermes configuration changes.
+- persistent Hermes configuration changes beyond the proactive task set.
 
 State reads and writes made by `creature_state.py` inside the configured creature data directory are the expected operation of an enabled skill. Sensitive content still requires user permission before it is stored.
 
-## Hermes Cron Integration
+## First-Contact Registration Flow
 
-Hermes Agent supports skill-backed jobs through its `cronjob` tool or `/cron` command. Cron sessions cannot create more cron jobs. Ask for schedule, time zone, delivery target, quiet hours, and autonomy preference before proposing a job.
+On `/hermes-digital-creature start`:
 
-For a user-approved daily touchpoint, use the platform's cron mechanism with this skill attached, for example through the Hermes `cronjob` tool:
+1. `proactive-diff --autonomy <level>` — returns three lists: `to_register`, `to_update`, `to_revoke`.
+2. For each `to_register` and `to_update` item: ask the Hermes cron tool to create the job using the provided `schedule`, `skill`, `prompt`, and `deliver` fields verbatim, then record:
 
-```python
-cronjob(
-    action="create",
-    name="digital-creature-daily-touchpoint",
-    schedule="every 1d at 09:00",
-    skill="hermes-digital-creature",
-    prompt="Run the daily touchpoint protocol. Respect configured quiet hours and autonomy. If there is no useful low-friction question or grounded observation, do not create artificial engagement.",
-    deliver="origin",
-)
-```
+   ```bash
+   creature_state.py proactive-register \
+     --task-id <id> --schedule <expr> --autonomy <level> \
+     --prompt <prompt> --deliver <deliver> --description <desc>
+   ```
 
-For an approved sleep/reflection pass:
+3. For each `to_revoke`: remove the cron job via Hermes, then record `proactive-revoke --task-id <id> --reason autonomy-change`.
+4. Summarize result in one line to the user.
 
-```python
-cronjob(
-    action="create",
-    name="digital-creature-sleep-review",
-    schedule="every 1d at 03:00",
-    skill="hermes-digital-creature",
-    prompt="Run the sleep protocol locally. Surface at most one grounded insight or one memory clarification at the next appropriate contact. Do not perform network or external file actions.",
-    deliver="local",
-)
-```
+If the cron tool call fails, **do not** call `proactive-register`. Report the gap to the user and leave the diff item pending.
 
-Adjust syntax to the active Hermes tool schema if it differs. Do not create either job merely because this reference was loaded.
+## Autonomy Change Mid-Session
+
+Same as first contact: rerun `proactive-diff` against the new level, apply each delta through Hermes cron + the matching `proactive-*` record. Confirm in one line.
+
+- `off → gentle/active`: registers missing tasks.
+- `gentle ↔ active`: registers/revokes the differing tasks.
+- `gentle/active → off`: revokes everything.
+
+## Disabling Proactive From Chat
+
+Recognize these intents and treat as `autonomy = off` for this session and persisted: "отключи проактивность", "не пиши сам", "хватит писать", "stop proactive", "turn off check-ins". Run the downgrade flow, write a `feedback` record with `kind=preference-ranking` describing the change, and confirm.
+
+## Proactive Task Schema
+
+`proactive_tasks` is the source of truth for what Hermes cron should have scheduled on behalf of this skill.
+
+| Column | Meaning |
+| --- | --- |
+| `task_id` | stable identifier; matches the cron job name in Hermes |
+| `schedule` | human cron expression as understood by the active Hermes cron tool |
+| `autonomy` | the autonomy level at which the task was registered |
+| `prompt` | prompt fired at tick time |
+| `deliver` | delivery target (e.g. `origin`, `local`) |
+| `status` | `registered` or `revoked` |
+| `registered_at` / `revoked_at` | timestamps |
+| `consent_source` | usually `autonomy:<level>`; user-specific additions use `user:<intent>` |
+
+Revoked rows are kept for audit and never deleted by the runtime.
 
 ## Expedition Lifecycle
 
@@ -82,7 +103,7 @@ Reflection may propose trait adjustment or memory consolidation; it must not exe
 
 ## Audit Expectations
 
-Every state mutation is visible through:
+Every state mutation — including `proactive-register` and `proactive-revoke` — is visible through:
 
 ```bash
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" audit --limit 20

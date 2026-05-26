@@ -118,6 +118,103 @@ class CreatureStateTests(unittest.TestCase):
         recalled = self.run_cmd("recall", "--query", "локальный сервер")["memories"]
         self.assertEqual(recalled[0]["id"], saved["id"])
 
+    def test_proactive_plan_per_autonomy(self) -> None:
+        self.run_cmd("init")
+        off = self.run_cmd("proactive-plan", "--autonomy", "off")
+        self.assertEqual(off["tasks"], [])
+        gentle = self.run_cmd("proactive-plan", "--autonomy", "gentle")
+        self.assertEqual(len(gentle["tasks"]), 1)
+        self.assertEqual(gentle["tasks"][0]["task_id"], "digital-creature-daily-touchpoint")
+        self.assertIn("09:00", gentle["tasks"][0]["schedule"])
+        active = self.run_cmd(
+            "proactive-plan",
+            "--autonomy",
+            "active",
+            "--touchpoint-time",
+            "08:30",
+            "--sleep-time",
+            "22:15",
+            "--progress-day",
+            "Mon",
+        )
+        ids = [task["task_id"] for task in active["tasks"]]
+        self.assertEqual(
+            ids,
+            [
+                "digital-creature-daily-touchpoint",
+                "digital-creature-sleep-review",
+                "digital-creature-weekly-progress",
+            ],
+        )
+        self.assertIn("08:30", active["tasks"][0]["schedule"])
+        self.assertIn("22:15", active["tasks"][1]["schedule"])
+        self.assertIn("Mon", active["tasks"][2]["schedule"])
+
+    def test_proactive_register_revoke_and_diff(self) -> None:
+        self.run_cmd("init")
+        plan = self.run_cmd("proactive-plan", "--autonomy", "gentle")["tasks"]
+        first = plan[0]
+        self.run_cmd(
+            "proactive-register",
+            "--task-id",
+            first["task_id"],
+            "--schedule",
+            first["schedule"],
+            "--autonomy",
+            "gentle",
+            "--prompt",
+            first["prompt"],
+            "--deliver",
+            first["deliver"],
+        )
+        again = self.run_cmd(
+            "proactive-register",
+            "--task-id",
+            first["task_id"],
+            "--schedule",
+            first["schedule"],
+            "--autonomy",
+            "gentle",
+        )
+        self.assertTrue(again.get("already_registered"))
+        listed = self.run_cmd("proactive-list", "--status", "registered")["tasks"]
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["task_id"], first["task_id"])
+        diff_to_active = self.run_cmd("proactive-diff", "--autonomy", "active")
+        diff_ids = [task["task_id"] for task in diff_to_active["to_register"]]
+        self.assertIn("digital-creature-sleep-review", diff_ids)
+        self.assertIn("digital-creature-weekly-progress", diff_ids)
+        diff_to_off = self.run_cmd("proactive-diff", "--autonomy", "off")
+        self.assertIn(first["task_id"], diff_to_off["to_revoke"])
+        self.run_cmd(
+            "proactive-revoke",
+            "--task-id",
+            first["task_id"],
+            "--reason",
+            "user-disable",
+        )
+        registered = self.run_cmd("proactive-list", "--status", "registered")["tasks"]
+        self.assertEqual(registered, [])
+        revoked = self.run_cmd("proactive-list", "--status", "revoked")["tasks"]
+        self.assertEqual(len(revoked), 1)
+        status = self.run_cmd("status")
+        self.assertEqual(status["proactive_tasks"], [])
+        audit = [entry["action"] for entry in self.run_cmd("audit")["audit"]]
+        self.assertIn("proactive-register", audit)
+        self.assertIn("proactive-revoke", audit)
+
+    def test_proactive_plan_rejects_bad_time(self) -> None:
+        self.run_cmd("init")
+        result = self.run_cmd(
+            "proactive-plan",
+            "--autonomy",
+            "gentle",
+            "--touchpoint-time",
+            "25:99",
+            expect=2,
+        )
+        self.assertIn("touchpoint-time", result["error"])
+
     def test_traits_activities_sleep_audit_and_purge(self) -> None:
         memory = self.run_cmd(
             "remember",
