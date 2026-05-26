@@ -15,10 +15,11 @@ import re
 import shutil
 import sqlite3
 import sys
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 MEMORY_TYPES = ("episodic", "preference", "procedural", "emotional", "meta-cognitive")
@@ -56,22 +57,44 @@ CAPABILITIES = {
     "explain-better": ("unlocked", "available from first contact"),
     "reflection": ("locked", "suggest after 3 feedback traces"),
     "tool-expedition": ("locked", "suggest after 2 completed activities and 3 feedback traces"),
-    "proactive-check-in": ("locked", "unlock only after explicit opt-in"),
 }
+RETIRED_CAPABILITIES = ("proactive-check-in",)
+AUTONOMY_LEVELS = ("off", "gentle", "active")
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 SENSITIVE_PATTERN = re.compile(
     r"(password|passphrase|secret|api[_ -]?key|token|credential|private[_ -]?key|seed phrase)",
     re.IGNORECASE,
 )
 TOKEN_PATTERN = re.compile(r"[\w-]{2,}", re.UNICODE)
 TIME_PATTERN = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
-WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-AUTONOMY_LEVELS = ("off", "gentle", "active")
+RU_SUFFIXES = (
+    "ого", "его", "ому", "ему", "ыми", "ими", "ями", "ами",
+    "ах", "ях", "ой", "ей", "ую", "юю", "ая", "яя", "ое", "ее", "ие", "ые",
+    "их", "ых", "ом", "ем", "ов", "ев", "ам", "ям",
+    "ал", "ил", "ел", "ла", "ло", "ли", "ть", "ся", "сь", "ка", "ки", "ке", "ку",
+    "у", "ю", "а", "я", "ы", "и", "о", "е", "й", "ь",
+)
+EN_SUFFIXES = ("ingly", "edly", "ing", "ies", "ied", "ed", "es", "ly", "s")
 SCHEMA_VERSION = 2
 MARKER_FILENAME = ".hermes-digital-creature-state"
+
+DEFAULT_AUTONOMY = "off"
+DEFAULT_QUIET_START = "23:00"
+DEFAULT_QUIET_END = "08:00"
 DEFAULT_TOUCHPOINT_TIME = "09:00"
 DEFAULT_SLEEP_TIME = "21:00"
 DEFAULT_PROGRESS_TIME = "19:00"
 DEFAULT_PROGRESS_DAY = "Sun"
+
+METADATA_DEFAULTS: dict[str, str] = {
+    "autonomy": DEFAULT_AUTONOMY,
+    "quiet_hours_start": DEFAULT_QUIET_START,
+    "quiet_hours_end": DEFAULT_QUIET_END,
+    "touchpoint_time": DEFAULT_TOUCHPOINT_TIME,
+    "sleep_time": DEFAULT_SLEEP_TIME,
+    "progress_time": DEFAULT_PROGRESS_TIME,
+    "progress_day": DEFAULT_PROGRESS_DAY,
+}
 
 
 def now_iso() -> str:
@@ -109,6 +132,117 @@ def ensure_safe_content(content: str) -> str:
     if len(text) > 1000:
         fail("memory content must be concise (maximum 1000 characters)")
     return text
+
+
+def strip_diacritics(text: str) -> str:
+    nfd = unicodedata.normalize("NFD", text)
+    return "".join(ch for ch in nfd if unicodedata.category(ch) != "Mn")
+
+
+def stem_token(token: str) -> str:
+    text = strip_diacritics(token.casefold())
+    if len(text) < 4:
+        return text
+    is_ascii = all(ord(ch) < 128 for ch in text)
+    suffixes = EN_SUFFIXES if is_ascii else RU_SUFFIXES
+    for suffix in sorted(suffixes, key=len, reverse=True):
+        if len(text) - len(suffix) >= 3 and text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
+def query_tokens(text: str) -> set[str]:
+    return {stem_token(token) for token in TOKEN_PATTERN.findall(text) if len(token) >= 2}
+
+
+def parse_hhmm(value: str) -> tuple[int, int]:
+    match = TIME_PATTERN.match(value)
+    if not match:
+        fail(f"invalid HH:MM time: {value}")
+    return int(match.group(1)), int(match.group(2))
+
+
+def time_to_minutes(value: str) -> int:
+    h, m = parse_hhmm(value)
+    return h * 60 + m
+
+
+def in_quiet_hours(now_hhmm: str, start: str, end: str) -> bool:
+    if start == end:
+        return False
+    now = time_to_minutes(now_hhmm)
+    s = time_to_minutes(start)
+    e = time_to_minutes(end)
+    if s < e:
+        return s <= now < e
+    return now >= s or now < e
+
+
+def current_local_hhmm() -> str:
+    return datetime.now().strftime("%H:%M")
+
+
+def age_days(timestamp: str | None) -> float:
+    if not timestamp:
+        return 365.0
+    parsed = datetime.fromisoformat(timestamp)
+    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 86400)
+
+
+def proactive_plan_tasks(autonomy: str, settings: dict[str, str]) -> list[dict[str, str]]:
+    if autonomy not in AUTONOMY_LEVELS:
+        fail(f"invalid autonomy: {autonomy}")
+    if autonomy == "off":
+        return []
+    touchpoint_time = settings.get("touchpoint_time", DEFAULT_TOUCHPOINT_TIME)
+    sleep_time = settings.get("sleep_time", DEFAULT_SLEEP_TIME)
+    progress_time = settings.get("progress_time", DEFAULT_PROGRESS_TIME)
+    progress_day = settings.get("progress_day", DEFAULT_PROGRESS_DAY)
+    for label, value in (
+        ("touchpoint-time", touchpoint_time),
+        ("sleep-time", sleep_time),
+        ("progress-time", progress_time),
+    ):
+        if not TIME_PATTERN.match(value):
+            fail(f"invalid {label}: {value}")
+    if progress_day not in WEEKDAYS:
+        fail(f"invalid progress-day: {progress_day}")
+    daily = {
+        "task_id": "digital-creature-daily-touchpoint",
+        "schedule": f"every 1d at {touchpoint_time}",
+        "skill": "hermes-digital-creature",
+        "prompt": (
+            "Run the daily touchpoint protocol. Respect configured quiet hours and autonomy. "
+            "If there is no useful low-friction question or grounded observation, do not create artificial engagement."
+        ),
+        "deliver": "origin",
+        "description": "Daily check-in: surface one recall candidate or clarification.",
+    }
+    if autonomy == "gentle":
+        return [daily]
+    sleep_task = {
+        "task_id": "digital-creature-sleep-review",
+        "schedule": f"every 1d at {sleep_time}",
+        "skill": "hermes-digital-creature",
+        "prompt": (
+            "Run the sleep protocol locally. Surface at most one grounded insight or memory "
+            "clarification at the next appropriate contact. Do not perform network or external file actions."
+        ),
+        "deliver": "local",
+        "description": "Nightly sleep analysis: stale memories, conflicts, recent feedback.",
+    }
+    weekly = {
+        "task_id": "digital-creature-weekly-progress",
+        "schedule": f"every 1 week on {progress_day} at {progress_time}",
+        "skill": "hermes-digital-creature",
+        "prompt": (
+            "Summarize progress: confirmed memories, feedback coverage, completed activities, "
+            "calibrated traits. Offer at most one eligible capability unlock. Do not unlock without consent."
+        ),
+        "deliver": "origin",
+        "description": "Weekly progress summary and capability suggestions.",
+    }
+    return [daily, sleep_task, weekly]
 
 
 class Store:
@@ -209,14 +343,6 @@ class Store:
                 uncertainty REAL NOT NULL CHECK(uncertainty BETWEEN 0 AND 1),
                 created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS audit (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
-                action TEXT NOT NULL,
-                entity_type TEXT NOT NULL,
-                entity_id TEXT,
-                detail TEXT NOT NULL
-            );
             CREATE TABLE IF NOT EXISTS proactive_tasks (
                 task_id TEXT PRIMARY KEY,
                 schedule TEXT NOT NULL,
@@ -229,17 +355,18 @@ class Store:
                 revoked_at TEXT,
                 consent_source TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                action TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT,
+                detail TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_entity_id ON audit(entity_id);
             """
         )
         timestamp = now_iso()
-        current_version = self.conn.execute(
-            "SELECT value FROM metadata WHERE key = 'schema_version'"
-        ).fetchone()
-        if current_version and int(current_version["value"]) < SCHEMA_VERSION:
-            self.conn.execute(
-                "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
-                (str(SCHEMA_VERSION),),
-            )
         self.conn.execute(
             "INSERT OR IGNORE INTO metadata(key, value) VALUES ('schema_version', ?)",
             (str(SCHEMA_VERSION),),
@@ -248,6 +375,11 @@ class Store:
             "INSERT OR IGNORE INTO metadata(key, value) VALUES ('created_at', ?)",
             (timestamp,),
         )
+        for key, value in METADATA_DEFAULTS.items():
+            self.conn.execute(
+                "INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)",
+                (key, value),
+            )
         for name, value in DEFAULT_TRAITS.items():
             self.conn.execute(
                 "INSERT OR IGNORE INTO traits(name, value, updated_at, reason) VALUES (?, ?, ?, ?)",
@@ -258,7 +390,46 @@ class Store:
                 "INSERT OR IGNORE INTO capabilities(name, status, reason, updated_at) VALUES (?, ?, ?, ?)",
                 (name, status, reason, timestamp),
             )
+        for name in RETIRED_CAPABILITIES:
+            self.conn.execute("DELETE FROM capabilities WHERE name = ?", (name,))
+        current_version_row = self.conn.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+        if current_version_row and int(current_version_row["value"]) < SCHEMA_VERSION:
+            self.conn.execute(
+                "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
+                (str(SCHEMA_VERSION),),
+            )
+            self.conn.execute(
+                "INSERT INTO audit(created_at, action, entity_type, entity_id, detail) VALUES (?, ?, ?, ?, ?)",
+                (
+                    timestamp,
+                    "schema-upgrade",
+                    "metadata",
+                    "schema_version",
+                    json.dumps(
+                        {"from": int(current_version_row["value"]), "to": SCHEMA_VERSION},
+                        sort_keys=True,
+                    ),
+                ),
+            )
         self.conn.commit()
+
+    def get_meta(self, key: str, default: str | None = None) -> str | None:
+        row = self.conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            return default
+        return row["value"]
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO metadata(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+    def settings(self) -> dict[str, str]:
+        return {key: (self.get_meta(key, default) or default) for key, default in METADATA_DEFAULTS.items()}
 
     def audit(self, action: str, entity_type: str, entity_id: str | None, detail: dict[str, Any]) -> None:
         self.conn.execute(
@@ -278,7 +449,15 @@ def serialize(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def cmd_init(store: Store, _: argparse.Namespace) -> None:
-    emit({"ok": True, "database": str(store.db_path), "schema_version": SCHEMA_VERSION, "local_only": True})
+    emit(
+        {
+            "ok": True,
+            "database": str(store.db_path),
+            "schema_version": SCHEMA_VERSION,
+            "local_only": True,
+            "settings": store.settings(),
+        }
+    )
 
 
 def cmd_status(store: Store, _: argparse.Namespace) -> None:
@@ -296,20 +475,31 @@ def cmd_status(store: Store, _: argparse.Namespace) -> None:
         for row in store.conn.execute("SELECT status, COUNT(*) AS count FROM activities GROUP BY status")
     }
     last_event = store.conn.execute("SELECT created_at, action FROM audit ORDER BY id DESC LIMIT 1").fetchone()
-    proactive_rows = store.conn.execute(
-        "SELECT task_id, schedule, autonomy, status FROM proactive_tasks WHERE status = 'registered' ORDER BY task_id"
-    ).fetchall()
+    proactive = [
+        serialize(row)
+        for row in store.conn.execute(
+            "SELECT task_id, schedule, autonomy, status FROM proactive_tasks "
+            "WHERE status = 'registered' ORDER BY task_id"
+        )
+    ]
+    settings = store.settings()
     emit(
         {
             "ok": True,
             "database": str(store.db_path),
-            "memories": {"active": counts.get("active", 0), "archived": counts.get("archived", 0), "superseded": counts.get("superseded", 0)},
+            "memories": {
+                "active": counts.get("active", 0),
+                "archived": counts.get("archived", 0),
+                "superseded": counts.get("superseded", 0),
+            },
             "traits": traits,
             "capabilities": capabilities,
             "feedback_count": feedback_count,
             "activities": activities,
-            "proactive_tasks": [serialize(row) for row in proactive_rows],
             "last_event": serialize(last_event) if last_event else None,
+            "autonomy": settings["autonomy"],
+            "quiet_hours": {"start": settings["quiet_hours_start"], "end": settings["quiet_hours_end"]},
+            "proactive_tasks": proactive,
         }
     )
 
@@ -354,7 +544,10 @@ def cmd_remember(store: Store, args: argparse.Namespace) -> None:
     if args.conflicts_with:
         store.memory(args.conflicts_with)
         group = args.conflict_group or ident("conflict")
-        store.conn.execute("UPDATE memories SET conflict_group = ? WHERE id IN (?, ?)", (group, memory_id, args.conflicts_with))
+        store.conn.execute(
+            "UPDATE memories SET conflict_group = ? WHERE id IN (?, ?)",
+            (group, memory_id, args.conflicts_with),
+        )
         store.conn.execute(
             "INSERT OR IGNORE INTO memory_links(from_id, to_id, relation) VALUES (?, ?, 'conflicts-with')",
             (memory_id, args.conflicts_with),
@@ -362,17 +555,6 @@ def cmd_remember(store: Store, args: argparse.Namespace) -> None:
     store.audit("remember", "memory", memory_id, {"type": args.type, "consent": args.consent, "source": args.source})
     store.conn.commit()
     emit({"ok": True, "memory": serialize(store.memory(memory_id))})
-
-
-def age_days(timestamp: str | None) -> float:
-    if not timestamp:
-        return 365.0
-    parsed = datetime.fromisoformat(timestamp)
-    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 86400)
-
-
-def query_tokens(text: str) -> set[str]:
-    return {token.casefold() for token in TOKEN_PATTERN.findall(text)}
 
 
 def cmd_recall(store: Store, args: argparse.Namespace) -> None:
@@ -402,7 +584,12 @@ def cmd_recall(store: Store, args: argparse.Namespace) -> None:
             (timestamp, row["id"]),
         )
     if selected:
-        store.audit("recall", "memory", None, {"query": args.query[:120], "ids": [row["id"] for _, row, _ in selected]})
+        store.audit(
+            "recall",
+            "memory",
+            None,
+            {"query": args.query[:120], "ids": [row["id"] for _, row, _ in selected]},
+        )
         store.conn.commit()
     result = []
     for score, row, factors in selected:
@@ -444,7 +631,10 @@ def cmd_correct(store: Store, args: argparse.Namespace) -> None:
         fail("emotional memory correction requires explicit consent (--consent)")
     new_id = ident("mem")
     timestamp = now_iso()
-    store.conn.execute("UPDATE memories SET status = 'superseded', updated_at = ? WHERE id = ?", (timestamp, args.id))
+    store.conn.execute(
+        "UPDATE memories SET status = 'superseded', updated_at = ? WHERE id = ?",
+        (timestamp, args.id),
+    )
     store.conn.execute(
         """
         INSERT INTO memories(
@@ -474,7 +664,14 @@ def cmd_correct(store: Store, args: argparse.Namespace) -> None:
     )
     store.audit("correct", "memory", new_id, {"supersedes": args.id, "feedback_id": feedback_id})
     store.conn.commit()
-    emit({"ok": True, "memory": serialize(store.memory(new_id)), "superseded_id": args.id, "feedback_id": feedback_id})
+    emit(
+        {
+            "ok": True,
+            "memory": serialize(store.memory(new_id)),
+            "superseded_id": args.id,
+            "feedback_id": feedback_id,
+        }
+    )
 
 
 def cmd_archive(store: Store, args: argparse.Namespace) -> None:
@@ -482,7 +679,10 @@ def cmd_archive(store: Store, args: argparse.Namespace) -> None:
     if row["status"] == "archived":
         emit({"ok": True, "already_archived": True, "id": args.id})
         return
-    store.conn.execute("UPDATE memories SET status = 'archived', updated_at = ? WHERE id = ?", (now_iso(), args.id))
+    store.conn.execute(
+        "UPDATE memories SET status = 'archived', updated_at = ? WHERE id = ?",
+        (now_iso(), args.id),
+    )
     store.audit("archive", "memory", args.id, {"reason": args.reason})
     store.conn.commit()
     emit({"ok": True, "archived_id": args.id, "reason": args.reason})
@@ -509,10 +709,24 @@ def cmd_consolidate(store: Store, args: argparse.Namespace) -> None:
                              status, created_at, updated_at, source, consent)
         VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 'consolidation', ?)
         """,
-        (new_id, memory_type, content, confidence, importance, emotional_weight, decay_rate, timestamp, timestamp, int(args.consent)),
+        (
+            new_id,
+            memory_type,
+            content,
+            confidence,
+            importance,
+            emotional_weight,
+            decay_rate,
+            timestamp,
+            timestamp,
+            int(args.consent),
+        ),
     )
     for source in sources:
-        store.conn.execute("UPDATE memories SET status = 'superseded', updated_at = ? WHERE id = ?", (timestamp, source["id"]))
+        store.conn.execute(
+            "UPDATE memories SET status = 'superseded', updated_at = ? WHERE id = ?",
+            (timestamp, source["id"]),
+        )
         store.conn.execute(
             "INSERT INTO memory_links(from_id, to_id, relation) VALUES (?, ?, 'consolidates')",
             (new_id, source["id"]),
@@ -554,33 +768,40 @@ def cmd_trait(store: Store, args: argparse.Namespace) -> None:
 def progression_metrics(store: Store) -> dict[str, int]:
     return {
         "active_memories": store.conn.execute("SELECT COUNT(*) FROM memories WHERE status = 'active'").fetchone()[0],
-        "confirmed_memories": store.conn.execute("SELECT COUNT(*) FROM memories WHERE status = 'active' AND consent = 1").fetchone()[0],
+        "confirmed_memories": store.conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE status = 'active' AND consent = 1"
+        ).fetchone()[0],
         "feedback_traces": store.conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0],
-        "completed_activities": store.conn.execute("SELECT COUNT(*) FROM activities WHERE status = 'completed'").fetchone()[0],
+        "completed_activities": store.conn.execute(
+            "SELECT COUNT(*) FROM activities WHERE status = 'completed'"
+        ).fetchone()[0],
         "reflections": store.conn.execute("SELECT COUNT(*) FROM reflections").fetchone()[0],
     }
 
 
 def cmd_progress(store: Store, _: argparse.Namespace) -> None:
     metrics = progression_metrics(store)
-    statuses = {
-        row["name"]: row["status"] for row in store.conn.execute("SELECT name, status FROM capabilities")
-    }
+    statuses = {row["name"]: row["status"] for row in store.conn.execute("SELECT name, status FROM capabilities")}
     suggestions: list[dict[str, str]] = []
-    if statuses["reflection"] == "locked" and metrics["feedback_traces"] >= 3:
+    if statuses.get("reflection") == "locked" and metrics["feedback_traces"] >= 3:
         suggestions.append({"capability": "reflection", "reason": "enough feedback exists for a grounded review"})
     if (
-        statuses["tool-expedition"] == "locked"
+        statuses.get("tool-expedition") == "locked"
         and metrics["feedback_traces"] >= 3
         and metrics["completed_activities"] >= 2
     ):
-        suggestions.append({"capability": "tool-expedition", "reason": "training history exists; every real expedition still needs approval"})
-    if statuses["proactive-check-in"] == "locked":
-        suggestions.append({"capability": "proactive-check-in", "reason": "available only if the user opts in to proactive contact"})
+        suggestions.append(
+            {
+                "capability": "tool-expedition",
+                "reason": "training history exists; every real expedition still needs approval",
+            }
+        )
     emit({"ok": True, "metrics": metrics, "capabilities": statuses, "unlock_suggestions": suggestions})
 
 
 def cmd_unlock(store: Store, args: argparse.Namespace) -> None:
+    if args.name not in CAPABILITIES:
+        fail(f"unknown capability: {args.name}")
     if not args.consent:
         fail("capability unlock requires explicit user consent (--consent)")
     reason = ensure_safe_content(args.reason)
@@ -590,7 +811,14 @@ def cmd_unlock(store: Store, args: argparse.Namespace) -> None:
     )
     store.audit("unlock", "capability", args.name, {"reason": reason, "approval_required_actions_unchanged": True})
     store.conn.commit()
-    emit({"ok": True, "capability": args.name, "status": "unlocked", "approval_required_actions_unchanged": True})
+    emit(
+        {
+            "ok": True,
+            "capability": args.name,
+            "status": "unlocked",
+            "approval_required_actions_unchanged": True,
+        }
+    )
 
 
 def cmd_activity(store: Store, args: argparse.Namespace) -> None:
@@ -625,11 +853,39 @@ def stale_rows(store: Store) -> list[dict[str, Any]]:
         days = age_days(row["last_recalled_at"] or row["updated_at"])
         retained = row["confidence"] * math.exp(-row["decay_rate"] * days / 30.0)
         if days >= 14 and retained < 0.58:
-            result.append({"id": row["id"], "content": row["content"], "age_days": round(days, 1), "retained_confidence": round(retained, 4)})
+            result.append(
+                {
+                    "id": row["id"],
+                    "content": row["content"],
+                    "age_days": round(days, 1),
+                    "retained_confidence": round(retained, 4),
+                }
+            )
     return result
 
 
-def cmd_daily(store: Store, _: argparse.Namespace) -> None:
+def suppression_state(store: Store, now: str | None) -> dict[str, Any]:
+    settings = store.settings()
+    when = now or current_local_hhmm()
+    parse_hhmm(when)
+    quiet = in_quiet_hours(when, settings["quiet_hours_start"], settings["quiet_hours_end"])
+    autonomy = settings["autonomy"]
+    reasons = []
+    if quiet:
+        reasons.append("quiet_hours")
+    if autonomy == "off":
+        reasons.append("autonomy_off")
+    return {
+        "now": when,
+        "quiet_hours": {"start": settings["quiet_hours_start"], "end": settings["quiet_hours_end"]},
+        "in_quiet_hours": quiet,
+        "autonomy": autonomy,
+        "suppressed": bool(reasons),
+        "suppression_reasons": reasons,
+    }
+
+
+def cmd_daily(store: Store, args: argparse.Namespace) -> None:
     candidate = store.conn.execute(
         """
         SELECT * FROM memories WHERE status = 'active'
@@ -639,23 +895,32 @@ def cmd_daily(store: Store, _: argparse.Namespace) -> None:
     unresolved = store.conn.execute(
         "SELECT COUNT(*) FROM memories WHERE status = 'active' AND confidence < 0.6"
     ).fetchone()[0]
-    active_activity = store.conn.execute("SELECT id, kind, title FROM activities WHERE status = 'active' ORDER BY created_at LIMIT 1").fetchone()
+    active_activity = store.conn.execute(
+        "SELECT id, kind, title FROM activities WHERE status = 'active' ORDER BY created_at LIMIT 1"
+    ).fetchone()
+    suppression = suppression_state(store, getattr(args, "now", None))
     emit(
         {
             "ok": True,
             "recall_candidate": serialize(candidate) if candidate else None,
             "tentative_memory_count": unresolved,
             "active_activity": serialize(active_activity) if active_activity else None,
-            "guidance": "Offer one recall/clarification/activity only when appropriate; do not force a check-in.",
+            "suppression": suppression,
+            "guidance": (
+                "If suppression.suppressed is true, do not deliver a proactive message. "
+                "Otherwise offer one recall/clarification/activity only when appropriate; do not force a check-in."
+            ),
         }
     )
 
 
-def cmd_sleep(store: Store, _: argparse.Namespace) -> None:
+def cmd_sleep(store: Store, args: argparse.Namespace) -> None:
     conflicts = [
         {"conflict_group": row["conflict_group"], "count": row["count"]}
         for row in store.conn.execute(
-            "SELECT conflict_group, COUNT(*) AS count FROM memories WHERE status = 'active' AND conflict_group IS NOT NULL GROUP BY conflict_group HAVING COUNT(*) > 1"
+            "SELECT conflict_group, COUNT(*) AS count FROM memories "
+            "WHERE status = 'active' AND conflict_group IS NOT NULL "
+            "GROUP BY conflict_group HAVING COUNT(*) > 1"
         )
     ]
     recent_feedback = [
@@ -664,11 +929,29 @@ def cmd_sleep(store: Store, _: argparse.Namespace) -> None:
     ]
     activities = {
         row["kind"]: row["count"]
-        for row in store.conn.execute("SELECT kind, COUNT(*) AS count FROM activities WHERE status = 'completed' GROUP BY kind")
+        for row in store.conn.execute(
+            "SELECT kind, COUNT(*) AS count FROM activities WHERE status = 'completed' GROUP BY kind"
+        )
     }
-    store.audit("sleep-analysis", "reflection", None, {"stale_count": len(stale_rows(store)), "conflict_count": len(conflicts)})
+    suppression = suppression_state(store, getattr(args, "now", None))
+    stale = stale_rows(store)
+    store.audit(
+        "sleep-analysis",
+        "reflection",
+        None,
+        {"stale_count": len(stale), "conflict_count": len(conflicts), "suppressed": suppression["suppressed"]},
+    )
     store.conn.commit()
-    emit({"ok": True, "stale_memories": stale_rows(store), "conflicts": conflicts, "recent_feedback": recent_feedback, "completed_activities": activities})
+    emit(
+        {
+            "ok": True,
+            "stale_memories": stale,
+            "conflicts": conflicts,
+            "recent_feedback": recent_feedback,
+            "completed_activities": activities,
+            "suppression": suppression,
+        }
+    )
 
 
 def cmd_reflect(store: Store, args: argparse.Namespace) -> None:
@@ -685,13 +968,19 @@ def cmd_reflect(store: Store, args: argparse.Namespace) -> None:
 
 
 def cmd_audit(store: Store, args: argparse.Namespace) -> None:
-    rows = store.conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (args.limit,)).fetchall()
+    if args.entity_id:
+        rows = store.conn.execute(
+            "SELECT * FROM audit WHERE entity_id = ? ORDER BY id DESC LIMIT ?",
+            (args.entity_id, args.limit),
+        ).fetchall()
+    else:
+        rows = store.conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (args.limit,)).fetchall()
     result = []
     for row in rows:
         item = serialize(row)
         item["detail"] = json.loads(item["detail"])
         result.append(item)
-    emit({"ok": True, "audit": result})
+    emit({"ok": True, "audit": result, "entity_id": args.entity_id})
 
 
 def cmd_export(store: Store, args: argparse.Namespace) -> None:
@@ -704,7 +993,18 @@ def cmd_export(store: Store, args: argparse.Namespace) -> None:
         f"{store.db_path.name}-wal",
     }:
         fail("export output cannot overwrite creature state database or ownership marker")
-    tables = ("metadata", "memories", "memory_links", "traits", "capabilities", "feedback", "activities", "reflections", "audit", "proactive_tasks")
+    tables = (
+        "metadata",
+        "memories",
+        "memory_links",
+        "traits",
+        "capabilities",
+        "feedback",
+        "activities",
+        "reflections",
+        "proactive_tasks",
+        "audit",
+    )
     payload: dict[str, Any] = {"exported_at": now_iso(), "schema_version": SCHEMA_VERSION}
     for table in tables:
         rows = store.conn.execute(f"SELECT * FROM {table}").fetchall()
@@ -730,88 +1030,111 @@ def cmd_purge(store: Store, args: argparse.Namespace) -> None:
     emit({"ok": True, "purged": str(data_dir)})
 
 
-def validate_time(value: str, label: str) -> str:
-    if not TIME_PATTERN.match(value):
-        fail(f"invalid {label} (expected HH:MM): {value}")
-    return value
+def cmd_autonomy(store: Store, args: argparse.Namespace) -> None:
+    if args.action == "get":
+        emit({"ok": True, "autonomy": store.get_meta("autonomy", DEFAULT_AUTONOMY)})
+        return
+    if args.value not in AUTONOMY_LEVELS:
+        fail(f"invalid autonomy: {args.value}")
+    previous = store.get_meta("autonomy", DEFAULT_AUTONOMY)
+    store.set_meta("autonomy", args.value)
+    store.audit("autonomy-set", "metadata", "autonomy", {"from": previous, "to": args.value})
+    store.conn.commit()
+    emit({"ok": True, "autonomy": args.value, "previous": previous})
 
 
-def proactive_plan_tasks(
-    autonomy: str,
-    touchpoint_time: str,
-    sleep_time: str,
-    progress_time: str,
-    progress_day: str,
-) -> list[dict[str, str]]:
-    if autonomy not in AUTONOMY_LEVELS:
-        fail(f"invalid autonomy: {autonomy}")
-    if progress_day not in WEEKDAYS:
-        fail(f"invalid progress day (Mon..Sun): {progress_day}")
-    validate_time(touchpoint_time, "touchpoint-time")
-    validate_time(sleep_time, "sleep-time")
-    validate_time(progress_time, "progress-time")
-    if autonomy == "off":
-        return []
-    daily = {
-        "task_id": "digital-creature-daily-touchpoint",
-        "schedule": f"every 1d at {touchpoint_time}",
-        "skill": "hermes-digital-creature",
-        "prompt": (
-            "Run the daily touchpoint protocol. Respect quiet hours and autonomy. "
-            "If there is no useful low-friction question or grounded observation, do not create artificial engagement."
-        ),
-        "deliver": "origin",
-        "description": "Daily check-in: surface one recall candidate or clarification.",
+def cmd_quiet_hours(store: Store, args: argparse.Namespace) -> None:
+    if args.action == "get":
+        emit(
+            {
+                "ok": True,
+                "start": store.get_meta("quiet_hours_start", DEFAULT_QUIET_START),
+                "end": store.get_meta("quiet_hours_end", DEFAULT_QUIET_END),
+            }
+        )
+        return
+    parse_hhmm(args.start)
+    parse_hhmm(args.end)
+    previous = {
+        "start": store.get_meta("quiet_hours_start", DEFAULT_QUIET_START),
+        "end": store.get_meta("quiet_hours_end", DEFAULT_QUIET_END),
     }
-    if autonomy == "gentle":
-        return [daily]
-    sleep_task = {
-        "task_id": "digital-creature-sleep-review",
-        "schedule": f"every 1d at {sleep_time}",
-        "skill": "hermes-digital-creature",
-        "prompt": (
-            "Run the sleep protocol locally. Surface at most one grounded insight or memory "
-            "clarification at the next appropriate contact. Do not perform network or external file actions."
-        ),
-        "deliver": "local",
-        "description": "Nightly sleep analysis: stale memories, conflicts, recent feedback.",
+    store.set_meta("quiet_hours_start", args.start)
+    store.set_meta("quiet_hours_end", args.end)
+    store.audit(
+        "quiet-hours-set",
+        "metadata",
+        "quiet_hours",
+        {"from": previous, "to": {"start": args.start, "end": args.end}},
+    )
+    store.conn.commit()
+    emit({"ok": True, "start": args.start, "end": args.end, "previous": previous})
+
+
+def resolved_plan_settings(store: Store, args: argparse.Namespace) -> tuple[str, dict[str, str]]:
+    settings = store.settings()
+    autonomy = args.autonomy or settings["autonomy"]
+    overrides = {
+        "touchpoint_time": args.touchpoint_time or settings["touchpoint_time"],
+        "sleep_time": args.sleep_time or settings["sleep_time"],
+        "progress_time": args.progress_time or settings["progress_time"],
+        "progress_day": args.progress_day or settings["progress_day"],
     }
-    weekly = {
-        "task_id": "digital-creature-weekly-progress",
-        "schedule": f"every 1 week on {progress_day} at {progress_time}",
-        "skill": "hermes-digital-creature",
-        "prompt": (
-            "Summarize progress: confirmed memories, feedback coverage, completed activities, "
-            "calibrated traits. Offer at most one eligible capability suggestion. Do not unlock without consent."
-        ),
-        "deliver": "origin",
-        "description": "Weekly progress summary and eligible capability suggestions.",
-    }
-    return [daily, sleep_task, weekly]
+    return autonomy, overrides
 
 
 def cmd_proactive_plan(store: Store, args: argparse.Namespace) -> None:
-    tasks = proactive_plan_tasks(
-        args.autonomy, args.touchpoint_time, args.sleep_time, args.progress_time, args.progress_day
+    autonomy, settings = resolved_plan_settings(store, args)
+    plan = proactive_plan_tasks(autonomy, settings)
+    emit({"ok": True, "autonomy": autonomy, "settings": settings, "tasks": plan})
+
+
+def cmd_proactive_diff(store: Store, args: argparse.Namespace) -> None:
+    autonomy, settings = resolved_plan_settings(store, args)
+    desired = proactive_plan_tasks(autonomy, settings)
+    desired_by_id = {task["task_id"]: task for task in desired}
+    current = {
+        row["task_id"]: dict(row)
+        for row in store.conn.execute("SELECT * FROM proactive_tasks WHERE status = 'registered'")
+    }
+    to_register: list[dict[str, str]] = []
+    to_update: list[dict[str, str]] = []
+    for task_id, task in desired_by_id.items():
+        if task_id not in current:
+            to_register.append(task)
+            continue
+        if current[task_id]["schedule"] != task["schedule"] or current[task_id]["autonomy"] != autonomy:
+            to_update.append(task)
+    to_revoke = [task_id for task_id in current if task_id not in desired_by_id]
+    emit(
+        {
+            "ok": True,
+            "autonomy": autonomy,
+            "to_register": to_register,
+            "to_update": to_update,
+            "to_revoke": to_revoke,
+        }
     )
-    emit({"ok": True, "autonomy": args.autonomy, "tasks": tasks})
 
 
 def cmd_proactive_register(store: Store, args: argparse.Namespace) -> None:
     if args.autonomy not in AUTONOMY_LEVELS:
         fail(f"invalid autonomy: {args.autonomy}")
-    timestamp = now_iso()
-    existing = store.conn.execute(
-        "SELECT * FROM proactive_tasks WHERE task_id = ?", (args.task_id,)
-    ).fetchone()
     description = args.description or ""
     prompt = args.prompt or ""
     deliver = args.deliver or "origin"
+    timestamp = now_iso()
+    existing = store.conn.execute(
+        "SELECT * FROM proactive_tasks WHERE task_id = ?",
+        (args.task_id,),
+    ).fetchone()
     if (
         existing
         and existing["status"] == "registered"
         and existing["schedule"] == args.schedule
         and existing["autonomy"] == args.autonomy
+        and existing["prompt"] == prompt
+        and existing["deliver"] == deliver
     ):
         emit({"ok": True, "already_registered": True, "task_id": args.task_id})
         return
@@ -839,32 +1162,32 @@ def cmd_proactive_register(store: Store, args: argparse.Namespace) -> None:
             prompt,
             deliver,
             timestamp,
-            args.consent_source or f"autonomy:{args.autonomy}",
+            f"autonomy:{args.autonomy}",
         ),
     )
     store.audit(
         "proactive-register",
         "proactive_task",
         args.task_id,
-        {"schedule": args.schedule, "autonomy": args.autonomy},
+        {"schedule": args.schedule, "autonomy": args.autonomy, "deliver": deliver},
     )
     store.conn.commit()
     emit({"ok": True, "task_id": args.task_id, "status": "registered"})
 
 
 def cmd_proactive_list(store: Store, args: argparse.Namespace) -> None:
-    rows = store.conn.execute(
-        "SELECT * FROM proactive_tasks ORDER BY registered_at DESC"
-    ).fetchall()
     if args.status:
-        rows = [row for row in rows if row["status"] == args.status]
+        rows = store.conn.execute(
+            "SELECT * FROM proactive_tasks WHERE status = ? ORDER BY task_id",
+            (args.status,),
+        ).fetchall()
+    else:
+        rows = store.conn.execute("SELECT * FROM proactive_tasks ORDER BY task_id").fetchall()
     emit({"ok": True, "tasks": [serialize(row) for row in rows]})
 
 
 def cmd_proactive_revoke(store: Store, args: argparse.Namespace) -> None:
-    row = store.conn.execute(
-        "SELECT * FROM proactive_tasks WHERE task_id = ?", (args.task_id,)
-    ).fetchone()
+    row = store.conn.execute("SELECT * FROM proactive_tasks WHERE task_id = ?", (args.task_id,)).fetchone()
     if not row:
         fail(f"proactive task not found: {args.task_id}")
     if row["status"] == "revoked":
@@ -875,41 +1198,103 @@ def cmd_proactive_revoke(store: Store, args: argparse.Namespace) -> None:
         "UPDATE proactive_tasks SET status = 'revoked', revoked_at = ? WHERE task_id = ?",
         (timestamp, args.task_id),
     )
-    reason = args.reason or ""
-    store.audit("proactive-revoke", "proactive_task", args.task_id, {"reason": reason})
+    store.audit(
+        "proactive-revoke",
+        "proactive_task",
+        args.task_id,
+        {"reason": args.reason or "", "previous_schedule": row["schedule"]},
+    )
     store.conn.commit()
     emit({"ok": True, "task_id": args.task_id, "status": "revoked"})
 
 
-def cmd_proactive_diff(store: Store, args: argparse.Namespace) -> None:
-    desired = proactive_plan_tasks(
-        args.autonomy, args.touchpoint_time, args.sleep_time, args.progress_time, args.progress_day
-    )
-    desired_by_id = {task["task_id"]: task for task in desired}
-    current = {
-        row["task_id"]: dict(row)
-        for row in store.conn.execute(
-            "SELECT * FROM proactive_tasks WHERE status = 'registered'"
-        ).fetchall()
+def cmd_doctor(store: Store, args: argparse.Namespace) -> None:
+    checks: dict[str, Any] = {}
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    checks["marker_present"] = store.marker_path.exists()
+    if not checks["marker_present"]:
+        errors.append("ownership marker missing")
+
+    version_row = store.conn.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()
+    actual_version = int(version_row["value"]) if version_row else None
+    checks["schema_version"] = {
+        "current": actual_version,
+        "expected": SCHEMA_VERSION,
+        "ok": actual_version == SCHEMA_VERSION,
     }
-    to_register: list[dict[str, str]] = []
-    to_update: list[dict[str, str]] = []
-    for task_id, task in desired_by_id.items():
-        existing = current.get(task_id)
-        if not existing:
-            to_register.append(task)
-        elif existing["schedule"] != task["schedule"] or existing["autonomy"] != args.autonomy:
-            to_update.append(task)
-    to_revoke = [task_id for task_id in current if task_id not in desired_by_id]
-    emit(
-        {
-            "ok": True,
-            "autonomy": args.autonomy,
-            "to_register": to_register,
-            "to_update": to_update,
-            "to_revoke": to_revoke,
+    if actual_version != SCHEMA_VERSION:
+        errors.append(f"schema version mismatch: {actual_version} != {SCHEMA_VERSION}")
+
+    settings = store.settings()
+    autonomy_ok = settings["autonomy"] in AUTONOMY_LEVELS
+    checks["autonomy"] = {"value": settings["autonomy"], "ok": autonomy_ok}
+    if not autonomy_ok:
+        errors.append(f"invalid stored autonomy: {settings['autonomy']}")
+
+    times_ok = True
+    for key in ("quiet_hours_start", "quiet_hours_end", "touchpoint_time", "sleep_time", "progress_time"):
+        if not TIME_PATTERN.match(settings[key]):
+            times_ok = False
+            errors.append(f"invalid HH:MM in metadata.{key}: {settings[key]}")
+    if settings["progress_day"] not in WEEKDAYS:
+        times_ok = False
+        errors.append(f"invalid progress_day: {settings['progress_day']}")
+    checks["time_settings"] = {
+        "ok": times_ok,
+        "quiet_hours": {"start": settings["quiet_hours_start"], "end": settings["quiet_hours_end"]},
+        "touchpoint_time": settings["touchpoint_time"],
+        "sleep_time": settings["sleep_time"],
+        "progress_time": settings["progress_time"],
+        "progress_day": settings["progress_day"],
+    }
+
+    if autonomy_ok and times_ok:
+        desired = proactive_plan_tasks(settings["autonomy"], settings)
+    else:
+        desired = []
+    desired_by_id = {task["task_id"]: task for task in desired}
+    registered_rows = store.conn.execute(
+        "SELECT * FROM proactive_tasks WHERE status = 'registered'"
+    ).fetchall()
+    registered_ids = {row["task_id"] for row in registered_rows}
+    desired_ids = set(desired_by_id)
+    drift_missing = sorted(desired_ids - registered_ids)
+    drift_extra = sorted(registered_ids - desired_ids)
+    drift_mismatch = []
+    for row in registered_rows:
+        target = desired_by_id.get(row["task_id"])
+        if target and (target["schedule"] != row["schedule"] or row["autonomy"] != settings["autonomy"]):
+            drift_mismatch.append(row["task_id"])
+    checks["proactive_tasks"] = {
+        "registered_count": len(registered_ids),
+        "expected_count": len(desired_ids),
+        "drift_missing": drift_missing,
+        "drift_extra": drift_extra,
+        "drift_mismatch": drift_mismatch,
+        "ok": not (drift_missing or drift_extra or drift_mismatch),
+    }
+    if not checks["proactive_tasks"]["ok"]:
+        warnings.append("registered proactive tasks do not match autonomy plan")
+
+    last_audit = store.conn.execute("SELECT created_at FROM audit ORDER BY id DESC LIMIT 1").fetchone()
+    checks["last_audit_at"] = last_audit["created_at"] if last_audit else None
+
+    checks["memory_db_writable"] = os.access(store.db_path, os.W_OK)
+    if not checks["memory_db_writable"]:
+        errors.append("creature.sqlite3 is not writable")
+
+    if times_ok:
+        now = args.now or current_local_hhmm()
+        checks["quiet_now"] = {
+            "now": now,
+            "in_quiet_hours": in_quiet_hours(now, settings["quiet_hours_start"], settings["quiet_hours_end"]),
         }
-    )
+    else:
+        warnings.append("skipping quiet-hours evaluation due to invalid time settings")
+
+    emit({"ok": not errors, "checks": checks, "warnings": warnings, "errors": errors})
 
 
 def parser() -> argparse.ArgumentParser:
@@ -968,7 +1353,11 @@ def parser() -> argparse.ArgumentParser:
     consolidate.set_defaults(func=cmd_consolidate)
 
     feedback = commands.add_parser("feedback")
-    feedback.add_argument("--kind", choices=("correction", "preference-ranking", "explanation-rating", "tool-evaluation", "quest-outcome"), required=True)
+    feedback.add_argument(
+        "--kind",
+        choices=("correction", "preference-ranking", "explanation-rating", "tool-evaluation", "quest-outcome"),
+        required=True,
+    )
     feedback.add_argument("--context", required=True)
     feedback.add_argument("--choice")
     feedback.add_argument("--signal")
@@ -983,7 +1372,7 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("progress").set_defaults(func=cmd_progress)
 
     unlock = commands.add_parser("unlock")
-    unlock.add_argument("--name", choices=tuple(CAPABILITIES), required=True)
+    unlock.add_argument("--name", required=True)
     unlock.add_argument("--reason", required=True)
     unlock.add_argument("--consent", action="store_true")
     unlock.set_defaults(func=cmd_unlock)
@@ -996,8 +1385,13 @@ def parser() -> argparse.ArgumentParser:
     activity.add_argument("--result")
     activity.set_defaults(func=cmd_activity)
 
-    commands.add_parser("daily").set_defaults(func=cmd_daily)
-    commands.add_parser("sleep").set_defaults(func=cmd_sleep)
+    daily = commands.add_parser("daily")
+    daily.add_argument("--now", help="HH:MM local time override for suppression evaluation")
+    daily.set_defaults(func=cmd_daily)
+
+    sleep_cmd = commands.add_parser("sleep")
+    sleep_cmd.add_argument("--now", help="HH:MM local time override for suppression evaluation")
+    sleep_cmd.set_defaults(func=cmd_sleep)
 
     reflect = commands.add_parser("reflect")
     reflect.add_argument("--content", required=True)
@@ -1007,6 +1401,7 @@ def parser() -> argparse.ArgumentParser:
 
     audit = commands.add_parser("audit")
     audit.add_argument("--limit", type=int, default=20)
+    audit.add_argument("--entity-id", default=None)
     audit.set_defaults(func=cmd_audit)
 
     export = commands.add_parser("export")
@@ -1018,56 +1413,71 @@ def parser() -> argparse.ArgumentParser:
     purge.add_argument("--confirm", required=True)
     purge.set_defaults(func=cmd_purge)
 
-    def add_time_args(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--touchpoint-time", default=DEFAULT_TOUCHPOINT_TIME)
-        p.add_argument("--sleep-time", default=DEFAULT_SLEEP_TIME)
-        p.add_argument("--progress-time", default=DEFAULT_PROGRESS_TIME)
-        p.add_argument("--progress-day", default=DEFAULT_PROGRESS_DAY, choices=WEEKDAYS)
+    autonomy = commands.add_parser("autonomy")
+    autonomy.add_argument("action", choices=("get", "set"))
+    autonomy.add_argument("--value")
+    autonomy.set_defaults(func=cmd_autonomy)
 
-    proactive_plan_p = commands.add_parser("proactive-plan")
-    proactive_plan_p.add_argument("--autonomy", choices=AUTONOMY_LEVELS, required=True)
-    add_time_args(proactive_plan_p)
-    proactive_plan_p.set_defaults(func=cmd_proactive_plan)
+    quiet = commands.add_parser("quiet-hours")
+    quiet.add_argument("action", choices=("get", "set"))
+    quiet.add_argument("--start")
+    quiet.add_argument("--end")
+    quiet.set_defaults(func=cmd_quiet_hours)
 
-    proactive_register_p = commands.add_parser("proactive-register")
-    proactive_register_p.add_argument("--task-id", required=True)
-    proactive_register_p.add_argument("--schedule", required=True)
-    proactive_register_p.add_argument("--autonomy", choices=AUTONOMY_LEVELS, required=True)
-    proactive_register_p.add_argument("--description", default="")
-    proactive_register_p.add_argument("--prompt", default="")
-    proactive_register_p.add_argument("--deliver", default="origin")
-    proactive_register_p.add_argument("--consent-source", default="")
-    proactive_register_p.set_defaults(func=cmd_proactive_register)
+    def add_plan_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--autonomy", choices=AUTONOMY_LEVELS, default=None)
+        p.add_argument("--touchpoint-time", default=None)
+        p.add_argument("--sleep-time", default=None)
+        p.add_argument("--progress-time", default=None)
+        p.add_argument("--progress-day", choices=WEEKDAYS, default=None)
 
-    proactive_list_p = commands.add_parser("proactive-list")
-    proactive_list_p.add_argument("--status", choices=("registered", "revoked"))
-    proactive_list_p.set_defaults(func=cmd_proactive_list)
+    plan = commands.add_parser("proactive-plan")
+    add_plan_args(plan)
+    plan.set_defaults(func=cmd_proactive_plan)
 
-    proactive_revoke_p = commands.add_parser("proactive-revoke")
-    proactive_revoke_p.add_argument("--task-id", required=True)
-    proactive_revoke_p.add_argument("--reason", default="")
-    proactive_revoke_p.set_defaults(func=cmd_proactive_revoke)
+    diff = commands.add_parser("proactive-diff")
+    add_plan_args(diff)
+    diff.set_defaults(func=cmd_proactive_diff)
 
-    proactive_diff_p = commands.add_parser("proactive-diff")
-    proactive_diff_p.add_argument("--autonomy", choices=AUTONOMY_LEVELS, required=True)
-    add_time_args(proactive_diff_p)
-    proactive_diff_p.set_defaults(func=cmd_proactive_diff)
+    register = commands.add_parser("proactive-register")
+    register.add_argument("--task-id", required=True)
+    register.add_argument("--schedule", required=True)
+    register.add_argument("--autonomy", choices=AUTONOMY_LEVELS, required=True)
+    register.add_argument("--description", default="")
+    register.add_argument("--prompt", default="")
+    register.add_argument("--deliver", default="origin")
+    register.set_defaults(func=cmd_proactive_register)
 
+    plist = commands.add_parser("proactive-list")
+    plist.add_argument("--status", choices=("registered", "revoked"), default=None)
+    plist.set_defaults(func=cmd_proactive_list)
+
+    revoke = commands.add_parser("proactive-revoke")
+    revoke.add_argument("--task-id", required=True)
+    revoke.add_argument("--reason", default="")
+    revoke.set_defaults(func=cmd_proactive_revoke)
+
+    doctor = commands.add_parser("doctor")
+    doctor.add_argument("--now", help="HH:MM local time override for quiet-hours evaluation")
+    doctor.set_defaults(func=cmd_doctor)
     return root
 
 
-def validate_activity_args(args: argparse.Namespace) -> None:
-    if args.command != "activity":
-        return
-    if args.action == "start" and (not args.kind or not args.title):
-        fail("activity start requires --kind and --title")
-    if args.action == "complete" and (not args.id or not args.result):
-        fail("activity complete requires --id and --result")
+def validate_args(args: argparse.Namespace) -> None:
+    if args.command == "activity":
+        if args.action == "start" and (not args.kind or not args.title):
+            fail("activity start requires --kind and --title")
+        if args.action == "complete" and (not args.id or not args.result):
+            fail("activity complete requires --id and --result")
+    if args.command == "autonomy" and args.action == "set" and not args.value:
+        fail("autonomy set requires --value")
+    if args.command == "quiet-hours" and args.action == "set" and (not args.start or not args.end):
+        fail("quiet-hours set requires --start and --end")
 
 
 def main() -> None:
     args = parser().parse_args()
-    validate_activity_args(args)
+    validate_args(args)
     store = Store(data_dir_from_arg(args.data_dir))
     try:
         args.func(store, args)

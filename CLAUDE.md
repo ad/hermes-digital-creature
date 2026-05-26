@@ -36,7 +36,7 @@ python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" init
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" status
 ```
 
-Subcommands exposed by `creature_state.py`: `init`, `status`, `remember`, `recall`, `memories`, `confirm`, `correct`, `archive`, `consolidate`, `feedback`, `trait`, `progress`, `unlock`, `activity`, `daily`, `sleep`, `reflect`, `audit`, `export`, `purge`, `proactive-plan`, `proactive-diff`, `proactive-register`, `proactive-list`, `proactive-revoke`.
+Subcommands exposed by `creature_state.py`: `init`, `status`, `remember`, `recall`, `memories`, `confirm`, `correct`, `archive`, `consolidate`, `feedback`, `trait`, `progress`, `unlock`, `activity`, `daily`, `sleep`, `reflect`, `audit`, `export`, `purge`, `autonomy`, `quiet-hours`, `proactive-plan`, `proactive-diff`, `proactive-register`, `proactive-list`, `proactive-revoke`, `doctor`.
 
 ## Architecture
 
@@ -52,8 +52,12 @@ The skill has two layers that must stay in sync:
 - `emotional` memories require `--consent`; high-confidence stores require explicit confirmation.
 - `correct` writes a new memory linked to the original via correction lineage; never silently overwrites.
 - `purge` requires the literal confirmation string `DELETE-ALL-CREATURE-DATA`.
-- Schema version pinned in `SCHEMA_VERSION`; whitelists for `MEMORY_TYPES`, `TRAITS`, `ACTIVITY_KINDS`, `CAPABILITIES`, `AUTONOMY_LEVELS`, `WEEKDAYS`.
-- Proactive scheduling: `proactive_plan_tasks()` produces the deterministic task set per autonomy level. `proactive_tasks` table is the source of truth for what Hermes cron should have registered on the skill's behalf. The autonomy setting itself counts as consent for that exact task set; anything outside still needs explicit per-action approval.
+- Schema version pinned in `SCHEMA_VERSION` (currently 2); `_schema()` autoupgrades older databases and writes a `schema-upgrade` audit row. Whitelists for `MEMORY_TYPES`, `TRAITS`, `ACTIVITY_KINDS`, `CAPABILITIES`, `AUTONOMY_LEVELS`, `WEEKDAYS`, `RETIRED_CAPABILITIES`.
+- Persisted settings live in the `metadata` table: `autonomy`, `quiet_hours_start`, `quiet_hours_end`, `touchpoint_time`, `sleep_time`, `progress_time`, `progress_day`. `autonomy` / `quiet-hours` subcommands read/write these and audit every change.
+- Proactive scheduling: `proactive_plan_tasks()` produces the deterministic task set per autonomy level (uses stored settings unless overridden). `proactive_tasks` table is the source of truth for what Hermes cron should have registered. The autonomy setting itself counts as consent for that exact task set; anything outside still needs explicit per-action approval. Revoked rows are kept for audit (never deleted).
+- `doctor` checks: ownership marker, schema version, valid autonomy/time settings, DB writability, and drift between the stored autonomy plan and what's recorded in `proactive_tasks`.
+- Recall tokenization (`stem_token` + `query_tokens`) strips diacritics and trims common Russian/English suffixes so different word endings of the same root match.
+- `daily` and `sleep` emit a `suppression` block computed from `quiet_hours` + `autonomy`; respect it before delivering proactive messages.
 
 When changing the runtime, keep the CLI surface (subcommand names, flags, JSON output shape) backward-compatible — `SKILL.md` and the references document those calls verbatim and Hermes invokes them as written. If you add a constraint to the script, mirror it in the relevant reference doc; if you add a behavior to a reference doc, make sure the script actually enforces it.
 

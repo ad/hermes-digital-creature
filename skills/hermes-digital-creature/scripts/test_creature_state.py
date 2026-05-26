@@ -175,6 +175,10 @@ class CreatureStateTests(unittest.TestCase):
             first["schedule"],
             "--autonomy",
             "gentle",
+            "--prompt",
+            first["prompt"],
+            "--deliver",
+            first["deliver"],
         )
         self.assertTrue(again.get("already_registered"))
         listed = self.run_cmd("proactive-list", "--status", "registered")["tasks"]
@@ -214,6 +218,108 @@ class CreatureStateTests(unittest.TestCase):
             expect=2,
         )
         self.assertIn("touchpoint-time", result["error"])
+
+    def test_autonomy_get_and_set_with_audit(self) -> None:
+        self.run_cmd("init")
+        initial = self.run_cmd("autonomy", "get")
+        self.assertEqual(initial["autonomy"], "off")
+        updated = self.run_cmd("autonomy", "set", "--value", "active")
+        self.assertEqual(updated["autonomy"], "active")
+        self.assertEqual(updated["previous"], "off")
+        self.assertEqual(self.run_cmd("status")["autonomy"], "active")
+        bad = self.run_cmd("autonomy", "set", "--value", "wild", expect=2)
+        self.assertIn("invalid", bad["error"])
+        actions = [entry["action"] for entry in self.run_cmd("audit")["audit"]]
+        self.assertIn("autonomy-set", actions)
+
+    def test_quiet_hours_get_and_set_validates(self) -> None:
+        self.run_cmd("init")
+        current = self.run_cmd("quiet-hours", "get")
+        self.assertEqual(current["start"], "23:00")
+        self.assertEqual(current["end"], "08:00")
+        updated = self.run_cmd("quiet-hours", "set", "--start", "22:30", "--end", "07:15")
+        self.assertEqual(updated["start"], "22:30")
+        self.assertEqual(updated["end"], "07:15")
+        bad = self.run_cmd("quiet-hours", "set", "--start", "25:00", "--end", "08:00", expect=2)
+        self.assertIn("HH:MM", bad["error"])
+
+    def test_daily_reports_quiet_hours_suppression(self) -> None:
+        self.run_cmd("init")
+        self.run_cmd("autonomy", "set", "--value", "gentle")
+        self.run_cmd("quiet-hours", "set", "--start", "22:00", "--end", "08:00")
+        quiet = self.run_cmd("daily", "--now", "23:30")
+        self.assertTrue(quiet["suppression"]["suppressed"])
+        self.assertIn("quiet_hours", quiet["suppression"]["suppression_reasons"])
+        awake = self.run_cmd("daily", "--now", "10:00")
+        self.assertFalse(awake["suppression"]["suppressed"])
+
+    def test_audit_entity_id_filter(self) -> None:
+        self.run_cmd("init")
+        memory = self.run_cmd(
+            "remember",
+            "--type",
+            "preference",
+            "--content",
+            "User likes audit filtering",
+            "--confidence",
+            "0.5",
+        )["memory"]
+        scoped = self.run_cmd("audit", "--entity-id", memory["id"])
+        self.assertEqual(scoped["entity_id"], memory["id"])
+        self.assertTrue(all(entry["entity_id"] == memory["id"] for entry in scoped["audit"]))
+        self.assertGreaterEqual(len(scoped["audit"]), 1)
+
+    def test_doctor_detects_proactive_drift(self) -> None:
+        self.run_cmd("init")
+        self.run_cmd("autonomy", "set", "--value", "gentle")
+        bad = self.run_cmd("doctor")
+        self.assertTrue(bad["ok"])
+        self.assertIn("digital-creature-daily-touchpoint", bad["checks"]["proactive_tasks"]["drift_missing"])
+        plan = self.run_cmd("proactive-plan")["tasks"][0]
+        self.run_cmd(
+            "proactive-register",
+            "--task-id",
+            plan["task_id"],
+            "--schedule",
+            plan["schedule"],
+            "--autonomy",
+            "gentle",
+            "--prompt",
+            plan["prompt"],
+            "--deliver",
+            plan["deliver"],
+        )
+        good = self.run_cmd("doctor")
+        self.assertTrue(good["checks"]["proactive_tasks"]["ok"])
+        self.assertEqual(good["checks"]["proactive_tasks"]["drift_missing"], [])
+
+    def test_recall_matches_morphological_variants(self) -> None:
+        saved = self.run_cmd(
+            "remember",
+            "--type",
+            "episodic",
+            "--content",
+            "Пользователь настраивал локальные сервера",
+            "--confidence",
+            "0.85",
+            "--consent",
+        )["memory"]
+        recalled = self.run_cmd("recall", "--query", "локальный сервер")["memories"]
+        self.assertEqual(recalled[0]["id"], saved["id"])
+
+    def test_proactive_check_in_capability_retired(self) -> None:
+        self.run_cmd("init")
+        caps = self.run_cmd("progress")["capabilities"]
+        self.assertNotIn("proactive-check-in", caps)
+        self.run_cmd(
+            "unlock",
+            "--name",
+            "proactive-check-in",
+            "--reason",
+            "legacy",
+            "--consent",
+            expect=2,
+        )
 
     def test_traits_activities_sleep_audit_and_purge(self) -> None:
         memory = self.run_cmd(

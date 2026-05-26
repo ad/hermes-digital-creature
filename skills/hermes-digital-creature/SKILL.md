@@ -1,7 +1,7 @@
 ---
 name: hermes-digital-creature
 description: "Use when a user wants a persistent local-first digital creature in Telegram or chat: daily companionship, remembered preferences, memory repair, cognitive mini-games, reflection/sleep cycles, trait growth, quests, or transparent autonomous expeditions. Operate Hermes as a creature that learns through feedback while storing inspectable state locally."
-version: 0.1.0
+version: 0.3.0
 author: Hermes Digital Creature
 license: MIT
 platforms: [linux, macos, windows]

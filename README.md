@@ -220,6 +220,47 @@ python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" unlock \
 
 An unlocked capability never removes approval requirements for tool actions or external side effects.
 
+### Autonomy, Proactive Tasks, And Doctor
+
+```bash
+# Read or change the persisted autonomy level
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" autonomy get
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" autonomy set --value gentle
+
+# Read or change quiet-hours suppression window
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" quiet-hours set \
+  --start 23:00 --end 08:00
+
+# Compute the deterministic task set for an autonomy level
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-plan \
+  --autonomy active
+
+# Diff desired plan vs. registered tasks (to_register / to_update / to_revoke)
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-diff \
+  --autonomy active
+
+# Record what Hermes cron actually scheduled (idempotent)
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-register \
+  --task-id digital-creature-daily-touchpoint \
+  --schedule "every 1d at 09:00" \
+  --autonomy gentle \
+  --prompt "Run the daily touchpoint protocol..." \
+  --deliver origin
+
+# Inspect registered/revoked proactive tasks
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-list \
+  --status registered
+
+# Remove a proactive task and write an audit entry
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-revoke \
+  --task-id digital-creature-daily-touchpoint --reason user-disable
+
+# Run skill diagnostics (schema, settings, drift between plan and registered tasks)
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" doctor
+```
+
+`proactive-plan` and `proactive-diff` fall back to the stored autonomy and time settings when called without flags. `doctor` exits non-zero on any structural error (missing marker, schema mismatch, invalid stored times, unwritable database).
+
 ### Reflection And Daily Loop
 
 ```bash
@@ -300,10 +341,16 @@ python3 -m unittest skills/hermes-digital-creature/scripts/test_creature_state.p
 The suite validates:
 
 - memory creation, recall, correction lineage, and export;
-- Cyrillic retrieval;
+- Cyrillic retrieval and morphology-aware recall (different word endings still match);
 - sensitive-memory rejection and confidence limits;
 - trait changes, activities, sleep analysis, audit, progression unlocks, and purge;
-- refusal to operate in a non-owned non-empty state directory.
+- refusal to operate in a non-owned non-empty state directory;
+- `autonomy` and `quiet-hours` get/set with HH:MM validation and audit;
+- `daily` suppression reporting during quiet hours;
+- `audit --entity-id` filtering;
+- `proactive-plan` / `proactive-diff` / `proactive-register` / `proactive-revoke` lifecycle and idempotency;
+- `doctor` drift detection between the stored autonomy plan and registered tasks;
+- retirement of the legacy `proactive-check-in` capability.
 
 The skill follows the current Hermes `SKILL.md` structure documented in:
 
