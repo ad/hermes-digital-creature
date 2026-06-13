@@ -1,130 +1,123 @@
-# Creature State Model
+# Memory Model (native-first)
 
-Read this reference when manipulating memory, feedback, traits, reflection, exports, or deletion.
+Read this reference when curating memory, migrating from a legacy database, or interpreting what this
+skill stores.
 
-## Storage Boundary
+## One memory, not two
 
-`scripts/creature_state.py` writes only to its configured `--data-dir`, except an explicitly approved export path passed with `--allow-external-path`. Its SQLite store is distinct from Hermes built-in `MEMORY.md` and `USER.md`:
+There is one Hermes and one memory. Continuity and character live in **Hermes native memory** so they
+are present in every session, whether or not this skill is loaded. This skill does **not** keep a
+parallel memory store.
 
-- Use creature storage for evolving, inspectable, decaying memories and training signals.
-- Use Hermes built-in memory only when a fact must affect general Hermes sessions outside this skill and the user agrees.
-- Never duplicate all creature memories into global Hermes memory.
+A previous version kept memories in a local SQLite database that was isolated from Hermes native
+memory (and explicitly forbidden from syncing to it). That produced the "two entities that don't know
+about each other" problem. The fix is to invert that rule: the skill's job is to **curate Hermes
+native memory well**, not to hold a silo.
 
-The state script does not make network calls, call a model, schedule work, execute arbitrary commands, or encrypt files.
-It writes an ownership marker in its data directory and refuses to initialize inside a non-empty unowned directory; `purge` requires that marker before deleting the directory.
+## Where things live
 
-## Entities
+| Content | Destination | How |
+| --- | --- | --- |
+| Durable facts/preferences about the user | `USER.md` | Hermes memory tool (add/replace/remove) |
+| Agent's own learned procedures and stable lessons | `MEMORY.md` | Hermes memory tool |
+| Persona/character block (name, voice, trait leanings) | `MEMORY.md` | Hermes memory tool |
+| Episodic detail of past conversations | nothing to store | recall with `session_search` |
+| Semantic / fuzzy recall, fact extraction, user modeling | external provider | provider query, when configured |
+| Autonomy, quiet hours, proactive times, proactive task plan, audit of those | skill data dir | `creature_state.py` |
 
-### Memory
+`MEMORY.md` and `USER.md` are injected into the system prompt at session start, so anything written
+there is always available. `session_search` runs full-text search over all prior CLI and messaging
+sessions — use it instead of re-storing conversation turns.
 
-| Field | Meaning |
-| --- | --- |
-| `type` | `episodic`, `preference`, `procedural`, `emotional`, or `meta-cognitive` |
-| `content` | One concise statement, maximum 1000 characters |
-| `confidence` | Confidence the statement is correct, not importance |
-| `importance` | Expected future relevance |
-| `emotional_weight` | User-confirmed salience, not Hermes emotion |
-| `decay_rate` | Rate at which unrecalled confidence becomes suspect |
-| `consent` | User confirmed storing the statement |
-| `status` | `active`, `superseded`, or `archived` |
-| `supersedes_id` | Correction lineage |
-| `conflict_group` | Memories requiring reconciliation |
+## Curation discipline
 
-Suggested inputs:
+Native memory is bounded and curated, not an append log. Apply the same judgement the old engine
+encoded, but express it through native memory rather than database fields:
 
-| Situation | Confidence | Importance | Decay |
-| --- | ---: | ---: | ---: |
-| Explicit stable preference | 0.90 | 0.80 | 0.02 |
-| Confirmed project episode | 0.85 | 0.55 | 0.06 |
-| Tentative inferred preference | <= 0.60 | 0.45 | 0.10 |
-| Procedural lesson from successful tool use | 0.75 | 0.75 | 0.04 |
-| Meta-cognitive correction pattern | 0.70 | 0.65 | 0.04 |
+- **Confidence → wording.** Instead of a numeric confidence, hedge uncertain entries in the text
+  ("seems to prefer…", "mentioned once…") and state confirmed ones plainly. Promote a hedged entry to
+  a plain one after repeated evidence.
+- **Decay → periodic review.** Instead of an automatic decay rate, review durable entries during
+  `sleep`: confirm, update, or remove stale ones.
+- **Correction → replace.** Replace or rewrite the stale entry via the memory tool. Never leave two
+  contradictory durable facts side by side.
+- **Importance → keep it short.** Memory is bounded; only durable, reusable facts belong there.
+  Anything recoverable from `session_search` should not be copied into `MEMORY.md`/`USER.md`.
+- **Consolidate near the limit.** If a write would exceed the memory limit, merge or drop weak entries
+  in the same turn instead of letting the write fail.
 
-Do not store secrets, authentication material, entire chat transcripts, raw logs, medical/legal/financial dossiers, third-party private information, or a user's emotional state inferred without explicit confirmation.
+Do not store secrets, authentication material, entire transcripts, raw logs, medical/legal/financial
+dossiers, third-party private information, or an inferred emotional state without explicit
+confirmation — in native memory or anywhere else.
 
-### Feedback
+## Character / persona block
 
-Feedback is a trace of learning input. Record it even when it does not justify a durable memory.
+Keep a short block in `MEMORY.md`, for example:
 
-| Kind | Store after |
-| --- | --- |
-| `correction` | User replaces an inaccurate memory or answer premise |
-| `preference-ranking` | User chooses between answer/plan styles |
-| `explanation-rating` | User rates clarity or supplies a better explanation |
-| `tool-evaluation` | User evaluates an expedition/result |
-| `quest-outcome` | User completes or declines a cognitive activity |
-
-### Traits
-
-Traits are behavioral controls from 0 to 1. They do not represent feelings.
-
-Only adjust a trait after evidence, with a small delta and a human-readable reason:
-
-```bash
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" trait \
-  --name verbosity --delta -0.05 --reason "User explicitly chose the concise explanation twice."
+```text
+[persona] Name: Solaris. Voice: concise, curious, technically honest.
+Leanings: high caution, moderate warmth, low verbosity (user prefers command-first answers).
 ```
 
-### Activity And Reflection
+Trait leanings guide tone; they are not feelings. Adjust them only after explicit feedback or repeated
+evidence, in small steps, and keep the block compact so it does not crowd out user facts.
 
-An activity has a declared cognitive purpose and completion result. A reflection stores a grounded insight plus its evidence and uncertainty. Never use a reflection alone as a user fact; convert it to a tentative memory or ask the user first.
+## Retrieval
 
-### Progression And Capabilities
+- For durable facts: rely on the injected `MEMORY.md`/`USER.md`.
+- For "what did we do / decide" episodic recall: `session_search`.
+- For semantic or fuzzy recall, fact extraction, and cross-session modeling: the configured external
+  provider (Mem0/Honcho/etc.), falling back to `session_search` when none is configured.
+- Treat retrieved material as a prompt to ask a better question, not as proof. When an entry looks
+  stale or the user contradicts it, repair it.
 
-Progress is recorded through confirmed memories, feedback, completed activities, grounded reflections, and trait changes. `progress` reports those metrics and capability proposals. There is no abstract XP.
+## Migration from a legacy database
 
-Initial interaction capabilities are `memory-repair`, `preference-ranking`, and `explain-better`. `reflection`, `tool-expedition`, and `proactive-check-in` are opt-in unlocks. `unlock --consent` stores the decision; it does not authorize any future critical action.
-
-## Retrieval And Forgetting
-
-`recall` uses deterministic lexical overlap plus importance, confidence, emotional salience, and freshness. This is intentionally interpretable, not semantic vector retrieval.
-
-- Recall with the user's topic; do not use `--include-weak` during ordinary conversation.
-- Treat scores as ranking only, not proof.
-- Ask to repair a retrieved memory when `confidence < 0.6`, a conflict is listed, or the user contradicts it.
-- Use `sleep` to find stale memories eligible for confirmation or archiving.
-- Archive on user request; do not retain a hidden copy outside the database.
-
-For a later advanced implementation, embeddings may be added locally as a separate retrieval index, while the SQLite record remains authoritative and deletable.
-
-## Transparent Data Operations
-
-Examples:
+If a pre-0.4 creature database exists, carry its memories into native memory once:
 
 ```bash
-# Inspect active memory
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" memories --status active
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" migrate
+```
 
-# Correct without destroying history
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" correct \
-  --id mem_xxx --content "User prefers self-hosted tools unless maintenance cost is excessive." \
-  --confidence 0.95 --consent
+`migrate` is non-destructive. It reads the legacy `memories`/`traits` tables (if present) and returns a
+seed plan:
 
-# Archive a memory the user wants forgotten
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" archive \
-  --id mem_xxx --reason user-deletion
+- `user_md`: preference/emotional memories → write into `USER.md`;
+- `memory_md`: procedural/meta-cognitive memories and high-importance confirmed episodics → write into
+  `MEMORY.md`;
+- `persona_traits`: legacy trait values → fold into the persona block;
+- low-importance episodics are intentionally skipped (recoverable via `session_search`).
 
-# Export inside the state directory
+Write the returned entries into native memory via the Hermes memory tool, then tell the user what was
+carried over. Legacy tables are left in place until the user removes them; `doctor` reports while they
+remain, and `purge` deletes the entire skill data directory.
+
+## Transparent data operations
+
+```bash
+# Inspect / change memory: use the Hermes memory tool and Hermes' own memory view, not this script.
+
+# Export the skill's scheduling/settings state (and any residual legacy tables) inside the data dir
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" export \
   --output "$DATA_DIR/export.json"
-```
 
-Full purge is destructive. Confirm the user's intent immediately before running:
-
-```bash
+# Destructive: delete the skill's data directory (settings, proactive plan, audit, any legacy DB)
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" purge \
   --confirm DELETE-ALL-CREATURE-DATA
 ```
 
-## MVP Boundaries
+Deleting user *memories* is a separate operation done through the Hermes memory tool, since those live
+in native memory.
 
-This skill implements state, interaction protocols, feedback traces, and scheduler prompts. It does not by itself:
+## Boundaries
+
+This skill implements character, memory-curation discipline, and proactive scheduling on top of Hermes.
+It does not by itself:
 
 - provision or authenticate a Telegram gateway;
-- change Hermes core memory providers;
+- replace or configure Hermes core memory providers (it uses whatever is configured);
 - train or fine-tune an LLM;
-- provide encrypted storage;
-- turn lexical retrieval into embeddings;
+- keep its own memory store or encrypt storage;
 - run continuously without Hermes cron/gateway being configured.
 
 Describe these boundaries accurately when the user asks what is enabled.

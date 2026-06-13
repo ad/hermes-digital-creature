@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Local state engine for the Hermes Digital Creature skill.
+"""Local scheduling/settings runtime for the Hermes Digital Creature skill.
+
+Native-first design: the creature's *memory and identity* live in Hermes built-in
+memory (``MEMORY.md`` / ``USER.md``), session search, and any configured external
+memory provider — there is only one Hermes. This script no longer keeps a parallel
+memory store. It owns only the deterministic state that Hermes does not provide for
+this skill on its own:
+
+- persisted settings (autonomy level, quiet hours, proactive times);
+- the proactive task plan and a record of what Hermes cron should have registered;
+- diagnostics (``doctor``) and a one-time ``migrate`` helper that turns any legacy
+  creature memories into a seed plan for native memory.
 
 This process intentionally has no network behavior and uses only Python stdlib.
 All persistent mutations happen inside the configured data directory.
@@ -9,74 +20,33 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import re
 import shutil
 import sqlite3
-import sys
-import unicodedata
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-MEMORY_TYPES = ("episodic", "preference", "procedural", "emotional", "meta-cognitive")
-TRAITS = (
-    "curiosity",
-    "skepticism",
-    "verbosity",
-    "warmth",
-    "abstraction",
-    "autonomy",
-    "caution",
-    "creativity",
-)
-DEFAULT_TRAITS = {
-    "curiosity": 0.60,
-    "skepticism": 0.55,
-    "verbosity": 0.45,
-    "warmth": 0.45,
-    "abstraction": 0.50,
-    "autonomy": 0.20,
-    "caution": 0.70,
-    "creativity": 0.45,
-}
-ACTIVITY_KINDS = (
-    "memory-repair",
-    "preference-ranking",
-    "detective-story",
-    "tool-expedition",
-    "explain-better",
-    "quest",
-)
-CAPABILITIES = {
-    "memory-repair": ("unlocked", "available from first contact"),
-    "preference-ranking": ("unlocked", "available from first contact"),
-    "explain-better": ("unlocked", "available from first contact"),
-    "reflection": ("locked", "suggest after 3 feedback traces"),
-    "tool-expedition": ("locked", "suggest after 2 completed activities and 3 feedback traces"),
-}
-RETIRED_CAPABILITIES = ("proactive-check-in",)
 AUTONOMY_LEVELS = ("off", "gentle", "active")
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-SENSITIVE_PATTERN = re.compile(
-    r"(password|passphrase|secret|api[_ -]?key|token|credential|private[_ -]?key|seed phrase)",
-    re.IGNORECASE,
-)
-TOKEN_PATTERN = re.compile(r"[\w-]{2,}", re.UNICODE)
 TIME_PATTERN = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
-RU_SUFFIXES = (
-    "ого", "его", "ому", "ему", "ыми", "ими", "ями", "ами",
-    "ах", "ях", "ой", "ей", "ую", "юю", "ая", "яя", "ое", "ее", "ие", "ые",
-    "их", "ых", "ом", "ем", "ов", "ев", "ам", "ям",
-    "ал", "ил", "ел", "ла", "ло", "ли", "ть", "ся", "сь", "ка", "ки", "ке", "ку",
-    "у", "ю", "а", "я", "ы", "и", "о", "е", "й", "ь",
-)
-EN_SUFFIXES = ("ingly", "edly", "ing", "ies", "ied", "ed", "es", "ly", "s")
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MARKER_FILENAME = ".hermes-digital-creature-state"
+
+# Legacy tables from schema <= 2. The runtime no longer creates or writes them,
+# but `migrate` reads them (when present) to seed native memory, and `export`
+# includes them if they still exist so nothing is silently hidden.
+LEGACY_TABLES = (
+    "memories",
+    "memory_links",
+    "traits",
+    "capabilities",
+    "feedback",
+    "activities",
+    "reflections",
+)
 
 DEFAULT_AUTONOMY = "off"
 DEFAULT_QUIET_START = "23:00"
@@ -101,14 +71,6 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def clamp(value: float) -> float:
-    return round(max(0.0, min(1.0, value)), 4)
-
-
-def ident(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:12]}"
-
-
 def emit(payload: Any) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
@@ -121,38 +83,6 @@ def fail(message: str, code: int = 2) -> None:
 def data_dir_from_arg(value: str | None) -> Path:
     raw = value or os.environ.get("HERMES_CREATURE_HOME") or "~/.hermes/data/hermes-digital-creature"
     return Path(raw).expanduser().resolve()
-
-
-def ensure_safe_content(content: str) -> str:
-    text = " ".join(content.split()).strip()
-    if not text:
-        fail("content cannot be empty")
-    if SENSITIVE_PATTERN.search(text):
-        fail("refusing to store content that appears to contain credentials or secrets")
-    if len(text) > 1000:
-        fail("memory content must be concise (maximum 1000 characters)")
-    return text
-
-
-def strip_diacritics(text: str) -> str:
-    nfd = unicodedata.normalize("NFD", text)
-    return "".join(ch for ch in nfd if unicodedata.category(ch) != "Mn")
-
-
-def stem_token(token: str) -> str:
-    text = strip_diacritics(token.casefold())
-    if len(text) < 4:
-        return text
-    is_ascii = all(ord(ch) < 128 for ch in text)
-    suffixes = EN_SUFFIXES if is_ascii else RU_SUFFIXES
-    for suffix in sorted(suffixes, key=len, reverse=True):
-        if len(text) - len(suffix) >= 3 and text.endswith(suffix):
-            return text[: -len(suffix)]
-    return text
-
-
-def query_tokens(text: str) -> set[str]:
-    return {stem_token(token) for token in TOKEN_PATTERN.findall(text) if len(token) >= 2}
 
 
 def parse_hhmm(value: str) -> tuple[int, int]:
@@ -182,13 +112,6 @@ def current_local_hhmm() -> str:
     return datetime.now().strftime("%H:%M")
 
 
-def age_days(timestamp: str | None) -> float:
-    if not timestamp:
-        return 365.0
-    parsed = datetime.fromisoformat(timestamp)
-    return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds() / 86400)
-
-
 def proactive_plan_tasks(autonomy: str, settings: dict[str, str]) -> list[dict[str, str]]:
     if autonomy not in AUTONOMY_LEVELS:
         fail(f"invalid autonomy: {autonomy}")
@@ -212,11 +135,13 @@ def proactive_plan_tasks(autonomy: str, settings: dict[str, str]) -> list[dict[s
         "schedule": f"every 1d at {touchpoint_time}",
         "skill": "hermes-digital-creature",
         "prompt": (
-            "Run the daily touchpoint protocol. Respect configured quiet hours and autonomy. "
-            "If there is no useful low-friction question or grounded observation, do not create artificial engagement."
+            "Run the daily touchpoint protocol. Recall relevant context from native memory "
+            "(injected MEMORY.md/USER.md plus session_search) before deciding whether to reach out. "
+            "Respect configured quiet hours and autonomy. If there is no useful low-friction question "
+            "or grounded observation, do not create artificial engagement."
         ),
         "deliver": "origin",
-        "description": "Daily check-in: surface one recall candidate or clarification.",
+        "description": "Daily check-in: surface one grounded recall or clarification, or stay silent.",
     }
     if autonomy == "gentle":
         return [daily]
@@ -225,22 +150,25 @@ def proactive_plan_tasks(autonomy: str, settings: dict[str, str]) -> list[dict[s
         "schedule": f"every 1d at {sleep_time}",
         "skill": "hermes-digital-creature",
         "prompt": (
-            "Run the sleep protocol locally. Surface at most one grounded insight or memory "
-            "clarification at the next appropriate contact. Do not perform network or external file actions."
+            "Run the sleep protocol locally: review native memory hygiene using the Hermes memory "
+            "tool and session_search (stale, redundant, or conflicting durable entries). Surface at most "
+            "one grounded consolidation or clarification at the next appropriate contact. Do not perform "
+            "network or external file actions."
         ),
         "deliver": "local",
-        "description": "Nightly sleep analysis: stale memories, conflicts, recent feedback.",
+        "description": "Nightly sleep analysis over native memory: stale, redundant, or conflicting entries.",
     }
     weekly = {
         "task_id": "digital-creature-weekly-progress",
         "schedule": f"every 1 week on {progress_day} at {progress_time}",
         "skill": "hermes-digital-creature",
         "prompt": (
-            "Summarize progress: confirmed memories, feedback coverage, completed activities, "
-            "calibrated traits. Offer at most one eligible capability unlock. Do not unlock without consent."
+            "Summarize progress from native memory and recent sessions: what was learned about the user, "
+            "which preferences are now stable, and which durable memories may need confirmation. "
+            "Keep it short and grounded; do not invent growth."
         ),
         "deliver": "origin",
-        "description": "Weekly progress summary and capability suggestions.",
+        "description": "Weekly progress summary grounded in native memory.",
     }
     return [daily, sleep_task, weekly]
 
@@ -276,72 +204,18 @@ class Store:
     def close(self) -> None:
         self.conn.close()
 
+    def table_exists(self, name: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        return row is not None
+
     def _schema(self) -> None:
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS memories (
-                id TEXT PRIMARY KEY,
-                type TEXT NOT NULL,
-                content TEXT NOT NULL,
-                confidence REAL NOT NULL CHECK(confidence BETWEEN 0 AND 1),
-                importance REAL NOT NULL CHECK(importance BETWEEN 0 AND 1),
-                emotional_weight REAL NOT NULL CHECK(emotional_weight BETWEEN 0 AND 1),
-                decay_rate REAL NOT NULL CHECK(decay_rate BETWEEN 0 AND 1),
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                last_recalled_at TEXT,
-                recall_count INTEGER NOT NULL DEFAULT 0,
-                source TEXT,
-                consent INTEGER NOT NULL DEFAULT 0,
-                supersedes_id TEXT REFERENCES memories(id),
-                conflict_group TEXT
-            );
-            CREATE TABLE IF NOT EXISTS memory_links (
-                from_id TEXT NOT NULL REFERENCES memories(id),
-                to_id TEXT NOT NULL REFERENCES memories(id),
-                relation TEXT NOT NULL,
-                PRIMARY KEY(from_id, to_id, relation)
-            );
-            CREATE TABLE IF NOT EXISTS traits (
-                name TEXT PRIMARY KEY,
-                value REAL NOT NULL CHECK(value BETWEEN 0 AND 1),
-                updated_at TEXT NOT NULL,
-                reason TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS capabilities (
-                name TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS feedback (
-                id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                context TEXT NOT NULL,
-                choice TEXT,
-                signal TEXT,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS activities (
-                id TEXT PRIMARY KEY,
-                kind TEXT NOT NULL,
-                title TEXT NOT NULL,
-                status TEXT NOT NULL,
-                result TEXT,
-                created_at TEXT NOT NULL,
-                completed_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS reflections (
-                id TEXT PRIMARY KEY,
-                content TEXT NOT NULL,
-                evidence TEXT NOT NULL,
-                uncertainty REAL NOT NULL CHECK(uncertainty BETWEEN 0 AND 1),
-                created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS proactive_tasks (
                 task_id TEXT PRIMARY KEY,
@@ -380,22 +254,11 @@ class Store:
                 "INSERT OR IGNORE INTO metadata(key, value) VALUES (?, ?)",
                 (key, value),
             )
-        for name, value in DEFAULT_TRAITS.items():
-            self.conn.execute(
-                "INSERT OR IGNORE INTO traits(name, value, updated_at, reason) VALUES (?, ?, ?, ?)",
-                (name, value, timestamp, "initial baseline"),
-            )
-        for name, (status, reason) in CAPABILITIES.items():
-            self.conn.execute(
-                "INSERT OR IGNORE INTO capabilities(name, status, reason, updated_at) VALUES (?, ?, ?, ?)",
-                (name, status, reason, timestamp),
-            )
-        for name in RETIRED_CAPABILITIES:
-            self.conn.execute("DELETE FROM capabilities WHERE name = ?", (name,))
         current_version_row = self.conn.execute(
             "SELECT value FROM metadata WHERE key = 'schema_version'"
         ).fetchone()
         if current_version_row and int(current_version_row["value"]) < SCHEMA_VERSION:
+            from_version = int(current_version_row["value"])
             self.conn.execute(
                 "UPDATE metadata SET value = ? WHERE key = 'schema_version'",
                 (str(SCHEMA_VERSION),),
@@ -407,10 +270,7 @@ class Store:
                     "schema-upgrade",
                     "metadata",
                     "schema_version",
-                    json.dumps(
-                        {"from": int(current_version_row["value"]), "to": SCHEMA_VERSION},
-                        sort_keys=True,
-                    ),
+                    json.dumps({"from": from_version, "to": SCHEMA_VERSION}, sort_keys=True),
                 ),
             )
         self.conn.commit()
@@ -437,12 +297,6 @@ class Store:
             (now_iso(), action, entity_type, entity_id, json.dumps(detail, ensure_ascii=False, sort_keys=True)),
         )
 
-    def memory(self, memory_id: str) -> sqlite3.Row:
-        row = self.conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-        if not row:
-            fail(f"memory not found: {memory_id}")
-        return row
-
 
 def serialize(row: sqlite3.Row) -> dict[str, Any]:
     return dict(row)
@@ -455,25 +309,13 @@ def cmd_init(store: Store, _: argparse.Namespace) -> None:
             "database": str(store.db_path),
             "schema_version": SCHEMA_VERSION,
             "local_only": True,
+            "memory_backend": "hermes-native",
             "settings": store.settings(),
         }
     )
 
 
 def cmd_status(store: Store, _: argparse.Namespace) -> None:
-    counts = {
-        row["status"]: row["count"]
-        for row in store.conn.execute("SELECT status, COUNT(*) AS count FROM memories GROUP BY status")
-    }
-    traits = {row["name"]: row["value"] for row in store.conn.execute("SELECT name, value FROM traits ORDER BY name")}
-    capabilities = {
-        row["name"]: row["status"] for row in store.conn.execute("SELECT name, status FROM capabilities ORDER BY name")
-    }
-    feedback_count = store.conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
-    activities = {
-        row["status"]: row["count"]
-        for row in store.conn.execute("SELECT status, COUNT(*) AS count FROM activities GROUP BY status")
-    }
     last_event = store.conn.execute("SELECT created_at, action FROM audit ORDER BY id DESC LIMIT 1").fetchone()
     proactive = [
         serialize(row)
@@ -487,381 +329,19 @@ def cmd_status(store: Store, _: argparse.Namespace) -> None:
         {
             "ok": True,
             "database": str(store.db_path),
-            "memories": {
-                "active": counts.get("active", 0),
-                "archived": counts.get("archived", 0),
-                "superseded": counts.get("superseded", 0),
-            },
-            "traits": traits,
-            "capabilities": capabilities,
-            "feedback_count": feedback_count,
-            "activities": activities,
-            "last_event": serialize(last_event) if last_event else None,
+            "memory_backend": "hermes-native",
             "autonomy": settings["autonomy"],
             "quiet_hours": {"start": settings["quiet_hours_start"], "end": settings["quiet_hours_end"]},
+            "times": {
+                "touchpoint": settings["touchpoint_time"],
+                "sleep": settings["sleep_time"],
+                "progress": settings["progress_time"],
+                "progress_day": settings["progress_day"],
+            },
             "proactive_tasks": proactive,
+            "last_event": serialize(last_event) if last_event else None,
         }
     )
-
-
-def cmd_remember(store: Store, args: argparse.Namespace) -> None:
-    content = ensure_safe_content(args.content)
-    if args.type == "emotional" and not args.consent:
-        fail("emotional memory requires explicit user consent (--consent)")
-    if not args.consent and args.confidence > 0.65:
-        fail("unconfirmed memory confidence cannot exceed 0.65; pass --consent for confirmed user input")
-    duplicate = store.conn.execute(
-        "SELECT id, content FROM memories WHERE status = 'active' AND lower(content) = lower(?)",
-        (content,),
-    ).fetchone()
-    if duplicate:
-        emit({"ok": True, "duplicate": True, "memory": serialize(duplicate)})
-        return
-    memory_id = ident("mem")
-    timestamp = now_iso()
-    store.conn.execute(
-        """
-        INSERT INTO memories(
-            id, type, content, confidence, importance, emotional_weight, decay_rate,
-            status, created_at, updated_at, source, consent, conflict_group
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
-        """,
-        (
-            memory_id,
-            args.type,
-            content,
-            clamp(args.confidence),
-            clamp(args.importance),
-            clamp(args.emotional_weight),
-            clamp(args.decay_rate),
-            timestamp,
-            timestamp,
-            args.source,
-            int(args.consent),
-            args.conflict_group,
-        ),
-    )
-    if args.conflicts_with:
-        store.memory(args.conflicts_with)
-        group = args.conflict_group or ident("conflict")
-        store.conn.execute(
-            "UPDATE memories SET conflict_group = ? WHERE id IN (?, ?)",
-            (group, memory_id, args.conflicts_with),
-        )
-        store.conn.execute(
-            "INSERT OR IGNORE INTO memory_links(from_id, to_id, relation) VALUES (?, ?, 'conflicts-with')",
-            (memory_id, args.conflicts_with),
-        )
-    store.audit("remember", "memory", memory_id, {"type": args.type, "consent": args.consent, "source": args.source})
-    store.conn.commit()
-    emit({"ok": True, "memory": serialize(store.memory(memory_id))})
-
-
-def cmd_recall(store: Store, args: argparse.Namespace) -> None:
-    tokens = query_tokens(args.query)
-    candidates = store.conn.execute("SELECT * FROM memories WHERE status = 'active'").fetchall()
-    ranked: list[tuple[float, sqlite3.Row, dict[str, float]]] = []
-    for row in candidates:
-        content_tokens = query_tokens(row["content"])
-        overlap = len(tokens & content_tokens) / max(1, len(tokens))
-        stale_days = age_days(row["last_recalled_at"] or row["updated_at"])
-        decay = math.exp(-row["decay_rate"] * stale_days / 30.0)
-        score = (
-            0.42 * overlap
-            + 0.23 * row["importance"]
-            + 0.20 * row["confidence"]
-            + 0.05 * row["emotional_weight"]
-            + 0.10 * decay
-        )
-        if overlap > 0 or args.include_weak:
-            ranked.append((score, row, {"semantic_overlap": round(overlap, 4), "freshness": round(decay, 4)}))
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    selected = ranked[: args.limit]
-    timestamp = now_iso()
-    for _, row, _ in selected:
-        store.conn.execute(
-            "UPDATE memories SET last_recalled_at = ?, recall_count = recall_count + 1 WHERE id = ?",
-            (timestamp, row["id"]),
-        )
-    if selected:
-        store.audit(
-            "recall",
-            "memory",
-            None,
-            {"query": args.query[:120], "ids": [row["id"] for _, row, _ in selected]},
-        )
-        store.conn.commit()
-    result = []
-    for score, row, factors in selected:
-        item = serialize(row)
-        item["score"] = round(score, 4)
-        item["factors"] = factors
-        result.append(item)
-    emit({"ok": True, "query": args.query, "memories": result})
-
-
-def cmd_memories(store: Store, args: argparse.Namespace) -> None:
-    rows = store.conn.execute(
-        "SELECT * FROM memories WHERE status = ? ORDER BY updated_at DESC LIMIT ?",
-        (args.status, args.limit),
-    ).fetchall()
-    emit({"ok": True, "status": args.status, "memories": [serialize(row) for row in rows]})
-
-
-def cmd_confirm(store: Store, args: argparse.Namespace) -> None:
-    row = store.memory(args.id)
-    if row["status"] != "active":
-        fail("only active memories can be confirmed")
-    confidence = clamp(args.confidence)
-    store.conn.execute(
-        "UPDATE memories SET confidence = ?, consent = 1, updated_at = ? WHERE id = ?",
-        (confidence, now_iso(), args.id),
-    )
-    store.audit("confirm", "memory", args.id, {"confidence": confidence})
-    store.conn.commit()
-    emit({"ok": True, "memory": serialize(store.memory(args.id))})
-
-
-def cmd_correct(store: Store, args: argparse.Namespace) -> None:
-    previous = store.memory(args.id)
-    if previous["status"] != "active":
-        fail("only active memories can be corrected")
-    content = ensure_safe_content(args.content)
-    if previous["type"] == "emotional" and not args.consent:
-        fail("emotional memory correction requires explicit consent (--consent)")
-    new_id = ident("mem")
-    timestamp = now_iso()
-    store.conn.execute(
-        "UPDATE memories SET status = 'superseded', updated_at = ? WHERE id = ?",
-        (timestamp, args.id),
-    )
-    store.conn.execute(
-        """
-        INSERT INTO memories(
-            id, type, content, confidence, importance, emotional_weight, decay_rate,
-            status, created_at, updated_at, source, consent, supersedes_id, conflict_group
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 'correction', ?, ?, ?)
-        """,
-        (
-            new_id,
-            previous["type"],
-            content,
-            clamp(args.confidence),
-            previous["importance"],
-            previous["emotional_weight"],
-            previous["decay_rate"],
-            timestamp,
-            timestamp,
-            int(args.consent),
-            args.id,
-            previous["conflict_group"],
-        ),
-    )
-    feedback_id = ident("fb")
-    store.conn.execute(
-        "INSERT INTO feedback(id, kind, context, choice, signal, created_at) VALUES (?, 'correction', ?, ?, ?, ?)",
-        (feedback_id, f"corrected {args.id}", new_id, content, timestamp),
-    )
-    store.audit("correct", "memory", new_id, {"supersedes": args.id, "feedback_id": feedback_id})
-    store.conn.commit()
-    emit(
-        {
-            "ok": True,
-            "memory": serialize(store.memory(new_id)),
-            "superseded_id": args.id,
-            "feedback_id": feedback_id,
-        }
-    )
-
-
-def cmd_archive(store: Store, args: argparse.Namespace) -> None:
-    row = store.memory(args.id)
-    if row["status"] == "archived":
-        emit({"ok": True, "already_archived": True, "id": args.id})
-        return
-    store.conn.execute(
-        "UPDATE memories SET status = 'archived', updated_at = ? WHERE id = ?",
-        (now_iso(), args.id),
-    )
-    store.audit("archive", "memory", args.id, {"reason": args.reason})
-    store.conn.commit()
-    emit({"ok": True, "archived_id": args.id, "reason": args.reason})
-
-
-def cmd_consolidate(store: Store, args: argparse.Namespace) -> None:
-    source_ids = list(dict.fromkeys(args.ids))
-    if len(source_ids) < 2:
-        fail("consolidation requires at least two source memory ids")
-    sources = [store.memory(item) for item in source_ids]
-    if any(row["status"] != "active" for row in sources):
-        fail("consolidation sources must be active")
-    content = ensure_safe_content(args.content)
-    new_id = ident("mem")
-    timestamp = now_iso()
-    memory_type = args.type or sources[0]["type"]
-    confidence = clamp(min(row["confidence"] for row in sources))
-    importance = clamp(max(row["importance"] for row in sources))
-    emotional_weight = clamp(max(row["emotional_weight"] for row in sources))
-    decay_rate = clamp(min(row["decay_rate"] for row in sources))
-    store.conn.execute(
-        """
-        INSERT INTO memories(id, type, content, confidence, importance, emotional_weight, decay_rate,
-                             status, created_at, updated_at, source, consent)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 'consolidation', ?)
-        """,
-        (
-            new_id,
-            memory_type,
-            content,
-            confidence,
-            importance,
-            emotional_weight,
-            decay_rate,
-            timestamp,
-            timestamp,
-            int(args.consent),
-        ),
-    )
-    for source in sources:
-        store.conn.execute(
-            "UPDATE memories SET status = 'superseded', updated_at = ? WHERE id = ?",
-            (timestamp, source["id"]),
-        )
-        store.conn.execute(
-            "INSERT INTO memory_links(from_id, to_id, relation) VALUES (?, ?, 'consolidates')",
-            (new_id, source["id"]),
-        )
-    store.audit("consolidate", "memory", new_id, {"source_ids": source_ids})
-    store.conn.commit()
-    emit({"ok": True, "memory": serialize(store.memory(new_id)), "source_ids": source_ids})
-
-
-def cmd_feedback(store: Store, args: argparse.Namespace) -> None:
-    feedback_id = ident("fb")
-    context = ensure_safe_content(args.context)
-    signal = ensure_safe_content(args.signal) if args.signal else None
-    store.conn.execute(
-        "INSERT INTO feedback(id, kind, context, choice, signal, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (feedback_id, args.kind, context, args.choice, signal, now_iso()),
-    )
-    store.audit("feedback", "feedback", feedback_id, {"kind": args.kind, "choice": args.choice})
-    store.conn.commit()
-    emit({"ok": True, "feedback_id": feedback_id})
-
-
-def cmd_trait(store: Store, args: argparse.Namespace) -> None:
-    if abs(args.delta) > 0.05:
-        fail("one trait adjustment must be between -0.05 and 0.05")
-    reason = ensure_safe_content(args.reason)
-    row = store.conn.execute("SELECT value FROM traits WHERE name = ?", (args.name,)).fetchone()
-    old_value = row["value"]
-    new_value = clamp(old_value + args.delta)
-    store.conn.execute(
-        "UPDATE traits SET value = ?, updated_at = ?, reason = ? WHERE name = ?",
-        (new_value, now_iso(), reason, args.name),
-    )
-    store.audit("trait-adjust", "trait", args.name, {"from": old_value, "to": new_value, "reason": reason})
-    store.conn.commit()
-    emit({"ok": True, "trait": args.name, "from": old_value, "to": new_value})
-
-
-def progression_metrics(store: Store) -> dict[str, int]:
-    return {
-        "active_memories": store.conn.execute("SELECT COUNT(*) FROM memories WHERE status = 'active'").fetchone()[0],
-        "confirmed_memories": store.conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE status = 'active' AND consent = 1"
-        ).fetchone()[0],
-        "feedback_traces": store.conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0],
-        "completed_activities": store.conn.execute(
-            "SELECT COUNT(*) FROM activities WHERE status = 'completed'"
-        ).fetchone()[0],
-        "reflections": store.conn.execute("SELECT COUNT(*) FROM reflections").fetchone()[0],
-    }
-
-
-def cmd_progress(store: Store, _: argparse.Namespace) -> None:
-    metrics = progression_metrics(store)
-    statuses = {row["name"]: row["status"] for row in store.conn.execute("SELECT name, status FROM capabilities")}
-    suggestions: list[dict[str, str]] = []
-    if statuses.get("reflection") == "locked" and metrics["feedback_traces"] >= 3:
-        suggestions.append({"capability": "reflection", "reason": "enough feedback exists for a grounded review"})
-    if (
-        statuses.get("tool-expedition") == "locked"
-        and metrics["feedback_traces"] >= 3
-        and metrics["completed_activities"] >= 2
-    ):
-        suggestions.append(
-            {
-                "capability": "tool-expedition",
-                "reason": "training history exists; every real expedition still needs approval",
-            }
-        )
-    emit({"ok": True, "metrics": metrics, "capabilities": statuses, "unlock_suggestions": suggestions})
-
-
-def cmd_unlock(store: Store, args: argparse.Namespace) -> None:
-    if args.name not in CAPABILITIES:
-        fail(f"unknown capability: {args.name}")
-    if not args.consent:
-        fail("capability unlock requires explicit user consent (--consent)")
-    reason = ensure_safe_content(args.reason)
-    store.conn.execute(
-        "UPDATE capabilities SET status = 'unlocked', reason = ?, updated_at = ? WHERE name = ?",
-        (reason, now_iso(), args.name),
-    )
-    store.audit("unlock", "capability", args.name, {"reason": reason, "approval_required_actions_unchanged": True})
-    store.conn.commit()
-    emit(
-        {
-            "ok": True,
-            "capability": args.name,
-            "status": "unlocked",
-            "approval_required_actions_unchanged": True,
-        }
-    )
-
-
-def cmd_activity(store: Store, args: argparse.Namespace) -> None:
-    if args.action == "start":
-        activity_id = ident("act")
-        title = ensure_safe_content(args.title)
-        store.conn.execute(
-            "INSERT INTO activities(id, kind, title, status, created_at) VALUES (?, ?, ?, 'active', ?)",
-            (activity_id, args.kind, title, now_iso()),
-        )
-        store.audit("activity-start", "activity", activity_id, {"kind": args.kind, "title": title})
-        store.conn.commit()
-        emit({"ok": True, "activity_id": activity_id, "status": "active"})
-        return
-    row = store.conn.execute("SELECT * FROM activities WHERE id = ?", (args.id,)).fetchone()
-    if not row:
-        fail(f"activity not found: {args.id}")
-    result = ensure_safe_content(args.result)
-    store.conn.execute(
-        "UPDATE activities SET status = 'completed', result = ?, completed_at = ? WHERE id = ?",
-        (result, now_iso(), args.id),
-    )
-    store.audit("activity-complete", "activity", args.id, {"result": result})
-    store.conn.commit()
-    emit({"ok": True, "activity_id": args.id, "status": "completed"})
-
-
-def stale_rows(store: Store) -> list[dict[str, Any]]:
-    rows = store.conn.execute("SELECT * FROM memories WHERE status = 'active'").fetchall()
-    result = []
-    for row in rows:
-        days = age_days(row["last_recalled_at"] or row["updated_at"])
-        retained = row["confidence"] * math.exp(-row["decay_rate"] * days / 30.0)
-        if days >= 14 and retained < 0.58:
-            result.append(
-                {
-                    "id": row["id"],
-                    "content": row["content"],
-                    "age_days": round(days, 1),
-                    "retained_confidence": round(retained, 4),
-                }
-            )
-    return result
 
 
 def suppression_state(store: Store, now: str | None) -> dict[str, Any]:
@@ -886,85 +366,37 @@ def suppression_state(store: Store, now: str | None) -> dict[str, Any]:
 
 
 def cmd_daily(store: Store, args: argparse.Namespace) -> None:
-    candidate = store.conn.execute(
-        """
-        SELECT * FROM memories WHERE status = 'active'
-        ORDER BY (importance * confidence) DESC, COALESCE(last_recalled_at, created_at) ASC LIMIT 1
-        """
-    ).fetchone()
-    unresolved = store.conn.execute(
-        "SELECT COUNT(*) FROM memories WHERE status = 'active' AND confidence < 0.6"
-    ).fetchone()[0]
-    active_activity = store.conn.execute(
-        "SELECT id, kind, title FROM activities WHERE status = 'active' ORDER BY created_at LIMIT 1"
-    ).fetchone()
     suppression = suppression_state(store, getattr(args, "now", None))
     emit(
         {
             "ok": True,
-            "recall_candidate": serialize(candidate) if candidate else None,
-            "tentative_memory_count": unresolved,
-            "active_activity": serialize(active_activity) if active_activity else None,
             "suppression": suppression,
             "guidance": (
                 "If suppression.suppressed is true, do not deliver a proactive message. "
-                "Otherwise offer one recall/clarification/activity only when appropriate; do not force a check-in."
+                "Otherwise run the touchpoint using native memory: recall relevant context via the Hermes "
+                "memory tool and session_search, then offer at most one grounded recall, clarification, or "
+                "observation. Staying silent is a valid outcome; never force a check-in."
             ),
         }
     )
 
 
 def cmd_sleep(store: Store, args: argparse.Namespace) -> None:
-    conflicts = [
-        {"conflict_group": row["conflict_group"], "count": row["count"]}
-        for row in store.conn.execute(
-            "SELECT conflict_group, COUNT(*) AS count FROM memories "
-            "WHERE status = 'active' AND conflict_group IS NOT NULL "
-            "GROUP BY conflict_group HAVING COUNT(*) > 1"
-        )
-    ]
-    recent_feedback = [
-        serialize(row)
-        for row in store.conn.execute("SELECT * FROM feedback ORDER BY created_at DESC LIMIT 5").fetchall()
-    ]
-    activities = {
-        row["kind"]: row["count"]
-        for row in store.conn.execute(
-            "SELECT kind, COUNT(*) AS count FROM activities WHERE status = 'completed' GROUP BY kind"
-        )
-    }
     suppression = suppression_state(store, getattr(args, "now", None))
-    stale = stale_rows(store)
-    store.audit(
-        "sleep-analysis",
-        "reflection",
-        None,
-        {"stale_count": len(stale), "conflict_count": len(conflicts), "suppressed": suppression["suppressed"]},
-    )
+    store.audit("sleep", "maintenance", None, {"suppressed": suppression["suppressed"]})
     store.conn.commit()
     emit(
         {
             "ok": True,
-            "stale_memories": stale,
-            "conflicts": conflicts,
-            "recent_feedback": recent_feedback,
-            "completed_activities": activities,
             "suppression": suppression,
+            "guidance": (
+                "Maintenance review of native memory only. Use the Hermes memory tool and session_search to "
+                "find stale, redundant, or conflicting durable entries in MEMORY.md/USER.md. Propose at most "
+                "one consolidation or one confirmation question at the next appropriate contact. Do not perform "
+                "network or external file actions, and do not present this as consciousness or autonomous learning."
+            ),
         }
     )
-
-
-def cmd_reflect(store: Store, args: argparse.Namespace) -> None:
-    content = ensure_safe_content(args.content)
-    evidence = ensure_safe_content(args.evidence)
-    reflection_id = ident("ref")
-    store.conn.execute(
-        "INSERT INTO reflections(id, content, evidence, uncertainty, created_at) VALUES (?, ?, ?, ?, ?)",
-        (reflection_id, content, evidence, clamp(args.uncertainty), now_iso()),
-    )
-    store.audit("reflect", "reflection", reflection_id, {"uncertainty": clamp(args.uncertainty)})
-    store.conn.commit()
-    emit({"ok": True, "reflection_id": reflection_id})
 
 
 def cmd_audit(store: Store, args: argparse.Namespace) -> None:
@@ -983,6 +415,80 @@ def cmd_audit(store: Store, args: argparse.Namespace) -> None:
     emit({"ok": True, "audit": result, "entity_id": args.entity_id})
 
 
+def cmd_migrate(store: Store, _: argparse.Namespace) -> None:
+    """Read any legacy creature memories and emit a non-destructive seed plan for native memory.
+
+    Hermes then writes these into MEMORY.md / USER.md via its own memory tool. Nothing is
+    deleted here; legacy tables remain until the user purges or manually cleans them.
+    """
+    user_md: list[dict[str, Any]] = []
+    memory_md: list[dict[str, Any]] = []
+    persona_traits: list[dict[str, Any]] = []
+    source_counts: dict[str, int] = {}
+    skipped_episodic = 0
+
+    if store.table_exists("memories"):
+        rows = store.conn.execute(
+            "SELECT id, type, content, confidence, importance, consent FROM memories WHERE status = 'active'"
+        ).fetchall()
+        for row in rows:
+            mem_type = row["type"]
+            source_counts[mem_type] = source_counts.get(mem_type, 0) + 1
+            entry = {
+                "legacy_id": row["id"],
+                "type": mem_type,
+                "content": row["content"],
+                "confidence": row["confidence"],
+                "importance": row["importance"],
+                "consent": bool(row["consent"]),
+            }
+            if mem_type in ("preference", "emotional"):
+                # Facts about the user belong in USER.md.
+                user_md.append(entry)
+            elif mem_type in ("procedural", "meta-cognitive"):
+                # Things the agent learned about how to work belong in MEMORY.md.
+                memory_md.append(entry)
+            else:  # episodic
+                # Episodes are recoverable via session_search; only carry forward
+                # high-importance, user-confirmed ones to avoid polluting native memory.
+                if row["importance"] >= 0.7 and row["consent"]:
+                    memory_md.append(entry)
+                else:
+                    skipped_episodic += 1
+
+    if store.table_exists("traits"):
+        for row in store.conn.execute("SELECT name, value FROM traits ORDER BY name").fetchall():
+            persona_traits.append({"name": row["name"], "value": row["value"]})
+
+    store.audit(
+        "migrate",
+        "data",
+        None,
+        {
+            "user_md": len(user_md),
+            "memory_md": len(memory_md),
+            "persona_traits": len(persona_traits),
+            "skipped_episodic": skipped_episodic,
+        },
+    )
+    store.conn.commit()
+    emit(
+        {
+            "ok": True,
+            "note": (
+                "Non-destructive seed plan. Write user_md entries into USER.md and memory_md entries plus a "
+                "persona/traits block into MEMORY.md via the Hermes memory tool. Episodic memories below the "
+                "carry-forward threshold are intentionally skipped; they remain reachable through session_search."
+            ),
+            "source_counts": source_counts,
+            "skipped_episodic": skipped_episodic,
+            "user_md": user_md,
+            "memory_md": memory_md,
+            "persona_traits": persona_traits,
+        }
+    )
+
+
 def cmd_export(store: Store, args: argparse.Namespace) -> None:
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -993,18 +499,9 @@ def cmd_export(store: Store, args: argparse.Namespace) -> None:
         f"{store.db_path.name}-wal",
     }:
         fail("export output cannot overwrite creature state database or ownership marker")
-    tables = (
-        "metadata",
-        "memories",
-        "memory_links",
-        "traits",
-        "capabilities",
-        "feedback",
-        "activities",
-        "reflections",
-        "proactive_tasks",
-        "audit",
-    )
+    tables = ["metadata", "proactive_tasks", "audit"]
+    # Include legacy tables when they still exist so an export never hides residual data.
+    tables.extend(name for name in LEGACY_TABLES if store.table_exists(name))
     payload: dict[str, Any] = {"exported_at": now_iso(), "schema_version": SCHEMA_VERSION}
     for table in tables:
         rows = store.conn.execute(f"SELECT * FROM {table}").fetchall()
@@ -1278,11 +775,19 @@ def cmd_doctor(store: Store, args: argparse.Namespace) -> None:
     if not checks["proactive_tasks"]["ok"]:
         warnings.append("registered proactive tasks do not match autonomy plan")
 
+    legacy_present = sorted(name for name in LEGACY_TABLES if store.table_exists(name))
+    checks["legacy_tables"] = {"present": legacy_present, "ok": True}
+    if legacy_present:
+        warnings.append(
+            "legacy memory tables are still present; run `migrate` to seed native memory, then `purge` "
+            "or remove them once seeded"
+        )
+
     last_audit = store.conn.execute("SELECT created_at FROM audit ORDER BY id DESC LIMIT 1").fetchone()
     checks["last_audit_at"] = last_audit["created_at"] if last_audit else None
 
-    checks["memory_db_writable"] = os.access(store.db_path, os.W_OK)
-    if not checks["memory_db_writable"]:
+    checks["db_writable"] = os.access(store.db_path, os.W_OK)
+    if not checks["db_writable"]:
         errors.append("creature.sqlite3 is not writable")
 
     if times_ok:
@@ -1298,92 +803,11 @@ def cmd_doctor(store: Store, args: argparse.Namespace) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(description="Local state runtime for Hermes Digital Creature")
+    root = argparse.ArgumentParser(description="Local scheduling/settings runtime for Hermes Digital Creature")
     root.add_argument("--data-dir", help="State directory; defaults to ~/.hermes/data/hermes-digital-creature")
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("init").set_defaults(func=cmd_init)
     commands.add_parser("status").set_defaults(func=cmd_status)
-
-    remember = commands.add_parser("remember")
-    remember.add_argument("--type", choices=MEMORY_TYPES, required=True)
-    remember.add_argument("--content", required=True)
-    remember.add_argument("--confidence", type=float, default=0.6)
-    remember.add_argument("--importance", type=float, default=0.5)
-    remember.add_argument("--emotional-weight", type=float, default=0.0)
-    remember.add_argument("--decay-rate", type=float, default=0.04)
-    remember.add_argument("--source", default="conversation")
-    remember.add_argument("--consent", action="store_true")
-    remember.add_argument("--conflicts-with")
-    remember.add_argument("--conflict-group")
-    remember.set_defaults(func=cmd_remember)
-
-    recall = commands.add_parser("recall")
-    recall.add_argument("--query", required=True)
-    recall.add_argument("--limit", type=int, default=5)
-    recall.add_argument("--include-weak", action="store_true")
-    recall.set_defaults(func=cmd_recall)
-
-    memories = commands.add_parser("memories")
-    memories.add_argument("--status", choices=("active", "archived", "superseded"), default="active")
-    memories.add_argument("--limit", type=int, default=100)
-    memories.set_defaults(func=cmd_memories)
-
-    confirm = commands.add_parser("confirm")
-    confirm.add_argument("--id", required=True)
-    confirm.add_argument("--confidence", type=float, default=0.95)
-    confirm.set_defaults(func=cmd_confirm)
-
-    correct = commands.add_parser("correct")
-    correct.add_argument("--id", required=True)
-    correct.add_argument("--content", required=True)
-    correct.add_argument("--confidence", type=float, default=0.95)
-    correct.add_argument("--consent", action="store_true")
-    correct.set_defaults(func=cmd_correct)
-
-    archive = commands.add_parser("archive")
-    archive.add_argument("--id", required=True)
-    archive.add_argument("--reason", required=True)
-    archive.set_defaults(func=cmd_archive)
-
-    consolidate = commands.add_parser("consolidate")
-    consolidate.add_argument("--ids", nargs="+", required=True)
-    consolidate.add_argument("--content", required=True)
-    consolidate.add_argument("--type", choices=MEMORY_TYPES)
-    consolidate.add_argument("--consent", action="store_true")
-    consolidate.set_defaults(func=cmd_consolidate)
-
-    feedback = commands.add_parser("feedback")
-    feedback.add_argument(
-        "--kind",
-        choices=("correction", "preference-ranking", "explanation-rating", "tool-evaluation", "quest-outcome"),
-        required=True,
-    )
-    feedback.add_argument("--context", required=True)
-    feedback.add_argument("--choice")
-    feedback.add_argument("--signal")
-    feedback.set_defaults(func=cmd_feedback)
-
-    trait = commands.add_parser("trait")
-    trait.add_argument("--name", choices=TRAITS, required=True)
-    trait.add_argument("--delta", type=float, required=True)
-    trait.add_argument("--reason", required=True)
-    trait.set_defaults(func=cmd_trait)
-
-    commands.add_parser("progress").set_defaults(func=cmd_progress)
-
-    unlock = commands.add_parser("unlock")
-    unlock.add_argument("--name", required=True)
-    unlock.add_argument("--reason", required=True)
-    unlock.add_argument("--consent", action="store_true")
-    unlock.set_defaults(func=cmd_unlock)
-
-    activity = commands.add_parser("activity")
-    activity.add_argument("action", choices=("start", "complete"))
-    activity.add_argument("--kind", choices=ACTIVITY_KINDS)
-    activity.add_argument("--title")
-    activity.add_argument("--id")
-    activity.add_argument("--result")
-    activity.set_defaults(func=cmd_activity)
 
     daily = commands.add_parser("daily")
     daily.add_argument("--now", help="HH:MM local time override for suppression evaluation")
@@ -1393,11 +817,8 @@ def parser() -> argparse.ArgumentParser:
     sleep_cmd.add_argument("--now", help="HH:MM local time override for suppression evaluation")
     sleep_cmd.set_defaults(func=cmd_sleep)
 
-    reflect = commands.add_parser("reflect")
-    reflect.add_argument("--content", required=True)
-    reflect.add_argument("--evidence", required=True)
-    reflect.add_argument("--uncertainty", type=float, default=0.4)
-    reflect.set_defaults(func=cmd_reflect)
+    migrate = commands.add_parser("migrate")
+    migrate.set_defaults(func=cmd_migrate)
 
     audit = commands.add_parser("audit")
     audit.add_argument("--limit", type=int, default=20)
@@ -1464,11 +885,6 @@ def parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.command == "activity":
-        if args.action == "start" and (not args.kind or not args.title):
-            fail("activity start requires --kind and --title")
-        if args.action == "complete" and (not args.id or not args.result):
-            fail("activity complete requires --id and --result")
     if args.command == "autonomy" and args.action == "set" and not args.value:
         fail("autonomy set requires --value")
     if args.command == "quiet-hours" and args.action == "set" and (not args.start or not args.end):
