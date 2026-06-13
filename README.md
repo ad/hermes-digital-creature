@@ -1,8 +1,18 @@
 # Hermes Digital Creature
 
-`hermes-digital-creature` is a local-first skill for [Hermes Agent](https://github.com/NousResearch/hermes-agent) that turns ordinary Telegram or chat interaction into a persistent digital creature experience.
+`hermes-digital-creature` is a skill for [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+that makes Hermes feel like one continuous, growing companion in Telegram or chat — remembered
+preferences, a recognizable character, learning from feedback, and optional proactive check-ins.
 
-It is not an RPG shell over an assistant. Its gameplay events produce inspectable cognitive state: corrected memories, preference rankings, explanation feedback, tool-evaluation traces, trait changes, reflection records, and opt-in capability growth.
+It is **not** a separate creature with its own brain. There is one Hermes and one memory: Hermes
+native memory (`MEMORY.md` / `USER.md`, `session_search`, and any configured external memory
+provider). This skill is a thin layer that gives that single Hermes a character, a disciplined way to
+curate its own memory, and a proactive cadence.
+
+> **Why 0.4 changed.** Earlier versions kept a separate SQLite "creature memory" isolated from Hermes
+> native memory. In practice that created two disconnected identities — the creature only "existed"
+> while the skill was loaded, and it could not see what Hermes learned elsewhere. 0.4 removes the
+> parallel store: continuity and character now live in native memory, present in every session.
 
 ## What This Repository Contains
 
@@ -18,68 +28,61 @@ skills/hermes-digital-creature/
     └── test_creature_state.py
 ```
 
-The repository is a Hermes skill tap layout: the installable artifact is under `skills/hermes-digital-creature/`.
+The repository is a Hermes skill tap layout: the installable artifact is under
+`skills/hermes-digital-creature/`.
+
+## How Memory Works
+
+| Content | Lives in | Accessed via |
+| --- | --- | --- |
+| Durable user facts / preferences | `USER.md` | Hermes memory tool (injected each session) |
+| Agent's learned procedures, lessons, persona block | `MEMORY.md` | Hermes memory tool (injected each session) |
+| Episodic detail of past conversations | conversation history | `session_search` (FTS over `~/.hermes/state.db`) |
+| Semantic / fuzzy recall, fact extraction | external provider | provider query (Mem0/Honcho/etc.), when configured |
+| Autonomy, quiet hours, proactive task plan, audit | this skill's data dir | `creature_state.py` |
+
+The skill's local data directory holds **only** scheduling/settings state and an audit of those
+changes — never user memories.
 
 ## Capabilities
 
-### Creature Interaction
-
 - Chat-first Telegram interaction without deep button trees.
 - First-contact onboarding with transparent privacy and autonomy controls.
-- Daily touchpoint protocol that can recall, clarify, or propose one useful activity.
-- Functional personality shaping through traits such as curiosity, caution, verbosity, and autonomy.
-
-### Meaningful Gameplay
-
-| Activity | Cognitive output |
-| --- | --- |
-| Memory repair | Confirmation, correction lineage, or deletion of stale memories |
-| Preference ranking | Feedback traces for response or plan style |
-| Explain better | Explanation quality signals and optional trait adjustments |
-| Detective story | Reasoning and uncertainty reflection without fictional user memories |
-| Tool expedition | Approved agent execution with result evaluation and procedural learning |
-
-### Persistent State
-
-The bundled standard-library Python runtime stores:
-
-- typed memories: `episodic`, `preference`, `procedural`, `emotional`, `meta-cognitive`;
-- confidence, importance, emotional salience, decay rate, conflicts, links, and recall counts;
-- user corrections and other feedback traces;
-- behavioral traits and opt-in capability unlocks;
-- activities, reflections, and mutation audit history.
-
-State is stored locally in SQLite at:
-
-```text
-~/.hermes/data/hermes-digital-creature/creature.sqlite3
-```
-
-The location is configurable through the Hermes skill config setting `digital_creature.data_dir`.
+- Continuity across every session, because memory lives in native `MEMORY.md`/`USER.md`.
+- A recognizable character via a short persona block in `MEMORY.md` (name, voice, functional trait
+  leanings) — guidance for tone, not emotion claims.
+- Memory-curation discipline: write sparingly and atomically, correct by replacing, review stale
+  entries during `sleep`.
+- Optional proactive cadence: daily touchpoint, nightly sleep review, weekly progress, gated by an
+  autonomy level and quiet hours.
+- One-time migration that seeds native memory from a legacy creature database.
 
 ## Principles Implemented
 
-- **Local-first:** creature state is local SQLite data; the runtime has no network behavior.
-- **Inspectable memory:** active memories and audit entries can be displayed and exported.
-- **Deletable memory:** individual memories can be archived and all creature data can be explicitly purged.
-- **Honest attachment:** Hermes may develop continuity and recognizable interaction preferences, but must not claim feelings or manipulate retention.
-- **Controlled autonomy:** proactive interactions and tool expeditions are opt-in; critical actions retain approval gates.
-- **Cognitive progression:** progress is represented by better-confirmed memories, collected feedback, reflections, and enabled capabilities rather than arbitrary XP.
+- **One Hermes, one memory:** no parallel memory silo; the skill curates native memory.
+- **Inspectable & deletable:** users inspect and edit memory through Hermes; skill scheduling state can
+  be exported and purged.
+- **Honest attachment:** Hermes develops continuity and recognizable preferences but never claims
+  feelings or manipulates retention.
+- **Controlled autonomy:** proactive interactions and tool expeditions are opt-in; critical actions
+  retain approval gates.
+- **Grounded growth:** progress is better-curated memory and confirmed preferences, not arbitrary XP.
 
 ## Requirements
 
 - Hermes Agent with skills enabled.
-- Python 3.10 or newer for the bundled state runtime.
+- The Hermes **memory** feature (`MEMORY.md`/`USER.md` + memory tool). Continuity depends on it; when
+  unavailable the skill degrades to an ordinary assistant for the session.
+- Python 3.10 or newer for the bundled scheduling/settings runtime.
 - A configured Hermes messaging gateway when using Telegram.
-- Hermes cron support. **Required** when `digital_creature.autonomy` is `gentle` or `active` — the skill auto-registers proactive tasks at first contact. If Hermes cron is unavailable, the skill degrades to `off` and tells the user.
-
-The skill is model-agnostic. For the intended interaction quality, use a model with structured tool calling, reliable multi-step reasoning, streaming, and a context window of at least 32k.
+- Hermes **cron** support. **Required** when `digital_creature.autonomy` is `gentle` or `active` — the
+  skill auto-registers proactive tasks at first contact. If cron is unavailable, the skill degrades to
+  `off` and tells the user.
+- Optional: an external memory provider (Mem0, Honcho, etc.) for semantic recall and fact extraction.
 
 ## Installation
 
 ### Install From A GitHub Tap
-
-Once this repository is published, install the single skill directly:
 
 ```bash
 hermes skills install ad/hermes-digital-creature/skills/hermes-digital-creature
@@ -94,7 +97,7 @@ hermes skills install ad/hermes-digital-creature/hermes-digital-creature
 
 ### Use A Local Checkout
 
-During development, configure Hermes to scan this checkout as an external skill directory. Add the absolute `skills/` directory to `~/.hermes/config.yaml`:
+During development, configure Hermes to scan this checkout as an external skill directory:
 
 ```yaml
 skills:
@@ -104,21 +107,17 @@ skills:
 
 Hermes discovers the skill as `/hermes-digital-creature` in CLI and configured messaging surfaces.
 
-### Configure Creature Settings
-
-The skill declares these non-secret Hermes settings:
+### Configure Settings
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| `digital_creature.data_dir` | `~/.hermes/data/hermes-digital-creature` | Local SQLite state, exports, and ownership marker |
+| `digital_creature.data_dir` | `~/.hermes/data/hermes-digital-creature` | Scheduling/settings state, audit, ownership marker (no user memories) |
 | `digital_creature.quiet_hours` | `23:00-08:00` | Suppress proactive delivery in local time |
 | `digital_creature.autonomy` | `gentle` | `off`, `gentle`, or `active` behavior profile |
 | `digital_creature.touchpoint_time` | `09:00` | Daily touchpoint time (HH:MM, local) for `gentle`/`active` |
 | `digital_creature.sleep_time` | `21:00` | Nightly sleep review time for `active` |
 | `digital_creature.progress_time` | `19:00` | Weekly progress summary time for `active` |
 | `digital_creature.progress_day` | `Sun` | Weekly progress summary weekday for `active` |
-
-Run the Hermes config migration after installation, or set values directly:
 
 ```bash
 hermes config migrate
@@ -128,33 +127,24 @@ hermes config set skills.config.digital_creature.quiet_hours 23:00-08:00
 
 ## Starting The Creature
 
-From Telegram or another Hermes conversation surface:
-
 ```text
 /hermes-digital-creature start
 ```
 
 On first contact, Hermes should:
 
-1. Initialize its local creature state.
-2. Explain local storage, inspection/deletion, optional proactive behavior, and approval gates briefly.
-3. Ask one setup question, such as the preferred interaction style or creature name.
-4. Store only confirmed information.
+1. Verify cron and the memory tool are available.
+2. Initialize local scheduling/settings state.
+3. Briefly explain that memory lives in Hermes' own `MEMORY.md`/`USER.md` (inspectable/editable),
+   autonomy is configurable, and critical actions need approval.
+4. Register the proactive tasks implied by the autonomy level.
+5. If a legacy creature database exists, run `migrate` once and seed native memory.
+6. Ask one optional setup question (name / preferred tone).
 
-Example first exchange:
+## Scheduling & Settings Runtime
 
-```text
-User: /hermes-digital-creature start
-
-Hermes: Я могу вести локальную память об этом взаимодействии: ее можно
-просмотреть, исправить, экспортировать или удалить. Проактивные сообщения
-включаются только с твоего согласия, а действия с инструментами требуют
-подтверждения. Какой стиль тебе удобнее: короткий, исследовательский или смешанный?
-```
-
-## State Runtime
-
-Hermes invokes the script while the skill is active. It can also be inspected manually:
+Hermes invokes the script while the skill is active. It can also be inspected manually. The runtime
+manages settings and the proactive plan — **memory is handled by the Hermes memory tool, not here.**
 
 ```bash
 SKILL_DIR="$PWD/skills/hermes-digital-creature"
@@ -164,175 +154,98 @@ python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" init
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" status
 ```
 
-### Memory Commands
-
-```bash
-# Save an explicitly confirmed preference
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" remember \
-  --type preference \
-  --content "User prefers local-first tooling." \
-  --confidence 0.90 \
-  --importance 0.80 \
-  --consent
-
-# Recall relevant memories
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" recall \
-  --query "local tooling" --limit 5
-
-# Correct a memory while preserving correction history
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" correct \
-  --id mem_xxx \
-  --content "User prefers local-first tooling unless maintenance cost is excessive." \
-  --confidence 0.95 \
-  --consent
-
-# Archive one memory after a deletion request
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" archive \
-  --id mem_xxx --reason user-deletion
-```
-
-Unconfirmed inferred memories cannot be stored with high confidence. Emotional memories require explicit consent. Strings that appear to contain credentials or secrets are rejected.
-
-### Feedback, Traits, And Progress
-
-```bash
-# Save a style selection made by the user
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" feedback \
-  --kind preference-ranking \
-  --context "Compared compact and explanatory response formats." \
-  --choice A \
-  --signal "Preferred compact response for command tasks."
-
-# Make a small evidence-backed trait update
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" trait \
-  --name verbosity --delta -0.05 \
-  --reason "User explicitly requested concise operational replies."
-
-# Inspect progress and offered capabilities
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" progress
-
-# Enable a capability only after opt-in
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" unlock \
-  --name reflection \
-  --reason "User enabled local reflection reviews." \
-  --consent
-```
-
-An unlocked capability never removes approval requirements for tool actions or external side effects.
-
 ### Autonomy, Proactive Tasks, And Doctor
 
 ```bash
-# Read or change the persisted autonomy level
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" autonomy get
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" autonomy set --value gentle
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" quiet-hours set --start 23:00 --end 08:00
 
-# Read or change quiet-hours suppression window
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" quiet-hours set \
-  --start 23:00 --end 08:00
-
-# Compute the deterministic task set for an autonomy level
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-plan \
-  --autonomy active
-
-# Diff desired plan vs. registered tasks (to_register / to_update / to_revoke)
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-diff \
-  --autonomy active
-
-# Record what Hermes cron actually scheduled (idempotent)
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-plan --autonomy active
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-diff --autonomy active
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-register \
   --task-id digital-creature-daily-touchpoint \
-  --schedule "every 1d at 09:00" \
-  --autonomy gentle \
-  --prompt "Run the daily touchpoint protocol..." \
-  --deliver origin
-
-# Inspect registered/revoked proactive tasks
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-list \
-  --status registered
-
-# Remove a proactive task and write an audit entry
+  --schedule "every 1d at 09:00" --autonomy gentle \
+  --prompt "Run the daily touchpoint protocol..." --deliver origin
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-list --status registered
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" proactive-revoke \
   --task-id digital-creature-daily-touchpoint --reason user-disable
 
-# Run skill diagnostics (schema, settings, drift between plan and registered tasks)
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" doctor
 ```
 
-`proactive-plan` and `proactive-diff` fall back to the stored autonomy and time settings when called without flags. `doctor` exits non-zero on any structural error (missing marker, schema mismatch, invalid stored times, unwritable database).
+`proactive-plan` and `proactive-diff` fall back to stored autonomy/time settings when called without
+flags. `doctor` exits non-zero on any structural error (missing marker, schema mismatch, invalid stored
+times, unwritable database) and warns about plan drift and any leftover legacy memory tables.
 
-### Reflection And Daily Loop
+### Daily Loop, Migration, Export, Deletion
 
 ```bash
+# Suppression decision + guidance for proactive runs (operate on native memory)
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" daily
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" sleep
 python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" audit --limit 20
+
+# One-time: turn a legacy creature DB into a seed plan for native memory (non-destructive)
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" migrate
+
+# Export the skill's scheduling/settings state (and any residual legacy tables) inside the data dir
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" export --output "$DATA_DIR/export.json"
+
+# Permanently delete the skill's data directory after an explicit user request
+python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" purge --confirm DELETE-ALL-CREATURE-DATA
 ```
 
-`daily` selects possible low-friction interaction material. `sleep` reports stale memories, conflicts, recent feedback, and completed activity counts. These operations analyze local state; they do not imply consciousness or perform external actions.
-
-### Export And Deletion
-
-```bash
-# Export within the state directory
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" export \
-  --output "$DATA_DIR/export.json"
-
-# Permanently delete all creature data after an explicit user request
-python3 "$SKILL_DIR/scripts/creature_state.py" --data-dir "$DATA_DIR" purge \
-  --confirm DELETE-ALL-CREATURE-DATA
-```
-
-The runtime creates an ownership marker and refuses to purge an unowned non-empty directory.
+`daily`/`sleep` return a suppression decision plus guidance; the actual recall/review is performed by
+Hermes over native memory. Deleting user *memories* is done through the Hermes memory tool, since they
+live in native storage. The runtime creates an ownership marker and refuses to purge an unowned
+non-empty directory.
 
 ## Telegram And Autonomy
 
-The skill is designed for an existing Hermes Telegram gateway. It does not configure a bot token or provision the gateway itself.
-
-Proactive behavior is driven by the `digital_creature.autonomy` setting. At first contact the skill auto-registers the matching cron tasks through Hermes cron; the autonomy setting itself counts as the user's consent for that task set.
+Proactive behavior is driven by `digital_creature.autonomy`. At first contact the skill auto-registers
+the matching cron tasks; the autonomy setting itself counts as consent for that task set.
 
 | Mode | Registered automatically | Other proactive behavior |
 | --- | --- | --- |
 | `off` | nothing | none — only responds when invoked |
 | `gentle` | daily touchpoint (`touchpoint_time`, default `09:00`) | none beyond that single task |
-| `active` | daily touchpoint + nightly sleep review (`sleep_time`, default `21:00`) + weekly progress summary (`progress_day` `progress_time`, default Sun `19:00`) | may propose scoped expeditions during a touchpoint (each still needs per-action approval) |
+| `active` | daily touchpoint + nightly sleep review (`sleep_time`, default `21:00`) + weekly progress (`progress_day` `progress_time`, default Sun `19:00`) | may propose scoped expeditions during a touchpoint (each still needs per-action approval) |
 
-External network actions, credential usage, writes outside creature state, destructive operations, and **non-default** scheduled jobs still require explicit per-action approval, regardless of autonomy.
-
-The user can disable proactive contact at any time by saying so in chat ("отключи проактивность", "stop proactive", etc.) — the skill revokes every registered task and switches to `off`. See [autonomy-and-scheduling.md](skills/hermes-digital-creature/references/autonomy-and-scheduling.md) for the full registration flow and schema.
+External network actions, credential usage, writes outside the data dir, destructive operations, and
+**non-default** scheduled jobs still require explicit per-action approval regardless of autonomy. The
+user can disable proactive contact anytime ("отключи проактивность", "stop proactive") — the skill
+revokes every registered task and switches to `off`. See
+[autonomy-and-scheduling.md](skills/hermes-digital-creature/references/autonomy-and-scheduling.md).
 
 ## Privacy And Security
 
-- `creature_state.py` uses Python standard library and SQLite only.
-- It performs no model calls and no external network calls.
+- `creature_state.py` uses Python standard library and SQLite only; no model calls, no network.
 - It refuses to initialize into a non-empty directory without its ownership marker.
-- It refuses secret-like memory content and limits memory entry length.
-- It stores correction lineage rather than silently rewriting facts.
-- It audits state mutations.
-- Full data purge requires a deliberate confirmation string.
+- It stores no user memories — those live in Hermes native memory, governed by Hermes' own controls.
+- It audits scheduling/settings mutations; full data purge requires a deliberate confirmation string.
+- Sensitive content is not written to memory without user permission (a memory-curation rule the model
+  follows; see [state-model.md](skills/hermes-digital-creature/references/state-model.md)).
 
-The current MVP does **not** provide encrypted storage at rest. Place the configured data directory on encrypted storage if that protection is required.
-
-## Current MVP Boundaries
+## Current Boundaries
 
 Implemented:
 
-- local creature memory and audit store;
-- transparent correction, retrieval, feedback, activity, reflection, and progression workflows;
+- a character/persona layer plus memory-curation discipline over Hermes native memory;
+- a one-time migration from the legacy creature database;
 - Telegram-oriented interaction policy;
 - safe scheduling and expedition protocols for Hermes to follow.
 
 Not implemented by this skill alone:
 
 - Telegram gateway provisioning or authentication;
-- vector embeddings or an external vector database;
+- a memory store of its own, vector embeddings, or an external vector database (it uses whatever Hermes
+  memory/provider is configured);
 - model training or fine-tuning;
 - encrypted storage;
 - Hermes core modification or automatic dependency installation.
 
 ## Development And Validation
-
-Run the bundled regression tests:
 
 ```bash
 python3 -m unittest skills/hermes-digital-creature/scripts/test_creature_state.py -v
@@ -340,20 +253,19 @@ python3 -m unittest skills/hermes-digital-creature/scripts/test_creature_state.p
 
 The suite validates:
 
-- memory creation, recall, correction lineage, and export;
-- Cyrillic retrieval and morphology-aware recall (different word endings still match);
-- sensitive-memory rejection and confidence limits;
-- trait changes, activities, sleep analysis, audit, progression unlocks, and purge;
-- refusal to operate in a non-owned non-empty state directory;
+- `init`/`status` reporting the native memory backend;
 - `autonomy` and `quiet-hours` get/set with HH:MM validation and audit;
-- `daily` suppression reporting during quiet hours;
+- `daily`/`sleep` suppression reporting during quiet hours;
 - `audit --entity-id` filtering;
 - `proactive-plan` / `proactive-diff` / `proactive-register` / `proactive-revoke` lifecycle and idempotency;
-- `doctor` drift detection between the stored autonomy plan and registered tasks;
-- retirement of the legacy `proactive-check-in` capability.
+- `doctor` drift detection and legacy-table reporting;
+- `migrate` bucketing of legacy memories into a native-memory seed plan;
+- schema auto-upgrade from a legacy (v2) database;
+- export contents and refusal to overwrite the state database;
+- refusal to operate in a non-owned non-empty state directory;
+- purge confirmation handling.
 
 The skill follows the current Hermes `SKILL.md` structure documented in:
 
 - [Hermes Skills System](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/skills.md)
 - [Creating Skills](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/creating-skills.md)
-
